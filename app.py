@@ -6,8 +6,8 @@ import threading
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'  # Change this!
 
-API_ID = YOUR_API_ID  # Replace with your API ID
-API_HASH = 'YOUR_API_HASH'  # Replace with your API hash
+API_ID = 28464245  # Replace with your API ID
+API_HASH = '6fe23ca19e7c7870dc2aff57fb05c4d9'  # Replace with your API hash
 
 SESSION_DIR = 'sessions'
 if not os.path.exists(SESSION_DIR):
