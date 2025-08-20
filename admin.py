@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # Replace with your actual bot token
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "7699253029:AAFqCLbE7wMK4DTHz1UJQRRN0MUO2TuPxg4"
 
 USERS_FILE = Path("users.json")
 USERS_DIR = Path("users")
