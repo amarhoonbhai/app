@@ -1,2 +1,0 @@
-telethon>=1.28.5
-colorama>=0.4.6
