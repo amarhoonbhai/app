@@ -20,8 +20,9 @@ def user_file(phone: str) -> Path:
 
 def save_user(phone: str, api_id: int, api_hash: str):
     f = user_file(phone)
+    data = {"phone": phone, "api_id": api_id, "api_hash": api_hash}
     with open(f, "w") as fp:
-        json.dump({"phone": phone, "api_id": api_id, "api_hash": api_hash}, fp, indent=2)
+        json.dump(data, fp, indent=2)
     print(f"💾 Saved user config: {f}")
 
 
@@ -63,6 +64,15 @@ def do_login():
         print(f"✅ Logged in as {me.first_name} (@{me.username}) id={me.id}")
         client.disconnect()
         start_runner(phone)   # auto-run background
+        print(
+            "\n🚀 Now you can use commands in Telegram:\n"
+            "  • .addgroup <link> → instantly join groups (folder links supported)\n"
+            "  • .listgroups / .delgroup <id>\n"
+            "  • .delay <s> → set forward delay\n"
+            "  • .time <m> → set cycle interval (minutes)\n"
+            "  • .status / .info / .help\n"
+            "📌 Send any message to Saved Messages → it will be included in the cycle forward."
+        )
     except errors.ApiIdInvalidError:
         print("❌ Invalid API_ID/API_HASH")
     except errors.PhoneCodeInvalidError:
@@ -102,3 +112,4 @@ def menu():
 
 if __name__ == "__main__":
     menu()
+
