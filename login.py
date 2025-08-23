@@ -1,100 +1,104 @@
 #!/usr/bin/env python3
-"""
-Interactive login for a Telegram account/session.
+# Multi-user login CLI. After login, auto-starts runner in background.
 
-- Creates a Telethon session under SESSIONS_DIR.
-- Ensures a matching user JSON exists under USERS_DIR.
-- Works with 2FA.
-"""
-
-import sys
-from datetime import date, timedelta
+import sys, subprocess, json
 from pathlib import Path
-
 from telethon.sync import TelegramClient
 from telethon import errors
 
-from app.config import load_config
-from app.storage import Storage, UserConfig
+USERS_DIR = Path("users")
+SESSIONS_DIR = Path("sessions")
+LOGS_DIR = Path("logs")
+
+for d in (USERS_DIR, SESSIONS_DIR, LOGS_DIR):
+    d.mkdir(exist_ok=True)
 
 
-def ask(prompt: str) -> str:
-    try:
-        return input(prompt).strip()
-    except EOFError:
-        print("\nInput aborted.", file=sys.stderr)
-        sys.exit(1)
+def user_file(phone: str) -> Path:
+    return USERS_DIR / f"{phone}.json"
 
 
-def main():
-    cfg = load_config()
+def save_user(phone: str, api_id: int, api_hash: str):
+    f = user_file(phone)
+    with open(f, "w") as fp:
+        json.dump({"phone": phone, "api_id": api_id, "api_hash": api_hash}, fp, indent=2)
+    print(f"💾 Saved user config: {f}")
 
-    # Get phone from env or prompt
-    phone = (sys.argv[1].strip() if len(sys.argv) > 1 else None) or ask("Phone number (e.g. +15551234567): ")
-    if not phone.startswith("+"):
-        print("Tip: include the country code, e.g. +1...", file=sys.stderr)
 
-    # Prepare paths
-    sessions_dir: Path = cfg.sessions_dir
-    users_dir: Path = cfg.users_dir
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    users_dir.mkdir(parents=True, exist_ok=True)
+def load_user(phone: str):
+    f = user_file(phone)
+    if not f.exists():
+        return None
+    with open(f) as fp:
+        return json.load(fp)
 
-    session_path = sessions_dir / f"{phone}.session"
-    user_json_path = users_dir / f"{phone}.json"
 
-    # Login
-    print(f"\nCreating/using session at: {session_path}")
-    client = TelegramClient(str(session_path), cfg.api_id, cfg.api_hash)
+def session_path(phone: str) -> Path:
+    return SESSIONS_DIR / f"{phone}.session"
 
-    def code_cb():
-        return ask("Enter the login code you just received: ")
 
-    def pwd_cb(hint: str):
-        return ask(f"Two-step password required (hint: {hint!r}). Enter password: ")
-
-    try:
-        # start() drives the sign-in flow; it will ask for code and password via our callbacks
-        client.start(
-            phone=phone,
-            code_callback=lambda: code_cb(),
-            password=lambda hint: pwd_cb(hint or ""),
+def start_runner(phone: str):
+    log_file = LOGS_DIR / f"runner_{phone}.log"
+    with open(log_file, "a") as lf:
+        subprocess.Popen(
+            [sys.executable, "runner.py", phone],
+            stdout=lf, stderr=lf,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
         )
+    print(f"✅ Runner started for {phone}. Logs: {log_file}")
+
+
+def do_login():
+    phone = input("Phone (+countrycode): ").strip()
+    api_id = int(input("API_ID: ").strip())
+    api_hash = input("API_HASH: ").strip()
+    save_user(phone, api_id, api_hash)
+
+    sess = session_path(phone)
+    client = TelegramClient(str(sess), api_id, api_hash)
+    try:
+        client.start(phone=lambda: phone)
+        me = client.get_me()
+        print(f"✅ Logged in as {me.first_name} (@{me.username}) id={me.id}")
+        client.disconnect()
+        start_runner(phone)   # auto-run background
     except errors.ApiIdInvalidError:
-        print("Your API_ID/API_HASH look invalid. Check environment variables.", file=sys.stderr)
-        sys.exit(1)
+        print("❌ Invalid API_ID/API_HASH")
     except errors.PhoneCodeInvalidError:
-        print("Invalid code. Please re-run and enter the correct code.", file=sys.stderr)
-        sys.exit(1)
+        print("❌ Wrong login code")
     except errors.PasswordHashInvalidError:
-        print("Wrong 2FA password. Please re-run with the correct password.", file=sys.stderr)
-        sys.exit(1)
+        print("❌ Wrong 2FA password")
     except Exception as e:
-        print(f"Login failed: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"❌ Login failed: {e}")
 
-    # Verify
-    me = client.get_me()
-    print(f"\n✅ Logged in as: {getattr(me, 'first_name', '')} @{getattr(me, 'username', '')} (id={me.id})")
 
-    # Ensure user JSON exists
-    if not user_json_path.exists():
-        default_expiry = (date.today() + timedelta(days=30)).isoformat()
-        cfg_obj = UserConfig(
-            phone=phone,
-            plan_expiry=default_expiry,
-            cycle_minutes=10,
-            groups=set(),
-        )
-        Storage(user_json_path).save(cfg_obj)
-        print(f"Created user config: {user_json_path} (plan_expiry={default_expiry})")
-    else:
-        print(f"User config already exists: {user_json_path}")
+def do_delete():
+    phone = input("Phone to delete: ").strip()
+    if session_path(phone).exists():
+        session_path(phone).unlink()
+        print(f"🗑️ Deleted session for {phone}")
+    if user_file(phone).exists():
+        user_file(phone).unlink()
+        print(f"🗑️ Deleted config for {phone}")
 
-    print("\nDone. You can now run:  python runner.py")
-    client.disconnect()
+
+def menu():
+    while True:
+        print("\n==== Multi-User Login Menu ====")
+        print("[1] Login (new user, auto-runner)")
+        print("[2] Delete user")
+        print("[3] Exit")
+        choice = input("> ").strip()
+        if choice == "1":
+            do_login()
+        elif choice == "2":
+            do_delete()
+        elif choice == "3":
+            break
+        else:
+            print("Invalid choice.")
 
 
 if __name__ == "__main__":
-    main()
-  
+    menu()
