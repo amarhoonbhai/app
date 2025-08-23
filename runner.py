@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # Runner for one user, started automatically after login.
+# - Instantly joins groups from .addgroup
+# - Saves groups & settings to users/<phone>.json (no duplicates)
+# - Forwards messages from Saved Messages to all groups
+# - Cycle forwarder: repeat all Saved Messages every X minutes with delay
 
-import sys, json, asyncio, re, time, random
+import sys, json, asyncio, re
 from pathlib import Path
 import httpx
 from telethon import TelegramClient, events, functions, types, errors
@@ -9,14 +13,11 @@ from telethon import TelegramClient, events, functions, types, errors
 USERS_DIR = Path("users")
 SESSIONS_DIR = Path("sessions")
 
-# runtime state
 runtime = {
-    "cycle_minutes": 10,
     "forward_delay": 5,
-    "queue": [],
+    "cycle_minutes": 30,   # default 30m
     "groups": [],
-    "join_marks": [],
-    "active_fw": 0
+    "saved_msgs": []       # stores ids of messages from Saved Messages
 }
 
 # regex
@@ -25,110 +26,87 @@ RE_INVITE = re.compile(r'https?://t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)', re.I)
 RE_USERLN = re.compile(r'https?://t\.me/([A-Za-z0-9_]{5,})', re.I)
 
 
+def user_file(phone: str) -> Path:
+    return USERS_DIR / f"{phone}.json"
+
+
 def load_user(phone: str):
-    with open(USERS_DIR / f"{phone}.json") as fp:
+    f = user_file(phone)
+    with open(f) as fp:
         return json.load(fp)
 
 
-def _fmt(sec: int) -> str:
-    sec = max(0, sec)
-    h, r = divmod(sec, 3600); m, s = divmod(r, 60)
-    return f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
+def save_user(phone: str, data: dict):
+    f = user_file(phone)
+    with open(f, "w") as fp:
+        json.dump(data, fp, indent=2)
 
 
-def _clean_marks():
-    now = time.time()
-    while runtime["join_marks"] and now - runtime["join_marks"][0] > 3600:
-        runtime["join_marks"].pop(0)
-
-
-def _avg_gap():
-    avg = 60
-    cap = 3600.0 / 15
-    return max(avg, cap)
-
-
-def _eta(qsize: int):
-    _clean_marks()
-    return runtime["active_fw"] + int(qsize * _avg_gap())
-
-
-async def _pause():
-    await asyncio.sleep(random.randint(45, 90))
-
-
-def _extract(html: str):
-    invites = set(RE_INVITE.findall(html))
-    users = set(u for u in RE_USERLN.findall(html) if not u.startswith(('+','joinchat')))
-    return invites, users
+def save_runtime(phone: str, cfg: dict):
+    save_user(phone, {
+        "phone": cfg["phone"],
+        "api_id": cfg["api_id"],
+        "api_hash": cfg["api_hash"],
+        "groups": runtime["groups"],
+        "forward_delay": runtime["forward_delay"],
+        "cycle_minutes": runtime["cycle_minutes"]
+    })
 
 
 async def _fetch_folder(url: str):
     async with httpx.AsyncClient(timeout=20) as hc:
         r = await hc.get(url if url.startswith('http') else f'https://{url}')
         r.raise_for_status()
-        return _extract(r.text)
+        text = r.text
+    invites = set(RE_INVITE.findall(text))
+    users = set(u for u in RE_USERLN.findall(text) if not u.startswith(('+','joinchat')))
+    return invites, users
 
 
-async def _join_worker(client):
-    while True:
-        if not runtime["queue"]:
-            await asyncio.sleep(5)
-            continue
-        item = runtime["queue"].pop(0)
-        kind, val = item["kind"], item["value"]
-
-        try:
-            added_id = None
-            if kind == "invite":
+async def _join_group(client, phone: str, kind: str, val: str, cfg: dict):
+    added_id = None
+    try:
+        if kind == "invite":
+            try:
+                await client(functions.messages.ImportChatInviteRequest(val))
+            except errors.UserAlreadyParticipantError:
+                pass
+            ent = await client.get_entity(val)
+            added_id = getattr(ent, "id", None)
+        elif kind == "username":
+            ent = await client.get_entity(val)
+            if isinstance(ent, types.Channel):
                 try:
-                    await client(functions.messages.ImportChatInviteRequest(val))
+                    await client(functions.channels.JoinChannelRequest(ent))
                 except errors.UserAlreadyParticipantError:
                     pass
-                added_id = await _resolve_id(client, val)
-            elif kind == "username":
-                ent = await _ensure_join_user(client, val)
-                added_id = getattr(ent, "id", None)
-            elif kind == "entity_id":
-                ent = await client.get_entity(int(val))
-                added_id = getattr(ent, "id", None)
+            added_id = getattr(ent, "id", None)
+        elif kind == "entity_id":
+            ent = await client.get_entity(int(val))
+            added_id = getattr(ent, "id", None)
 
-            if added_id and added_id not in runtime["groups"]:
-                runtime["groups"].append(added_id)
-                runtime["join_marks"].append(time.time())
-                print(f"✅ Joined {added_id} (queue {len(runtime['queue'])})")
-            else:
-                print(f"ℹ️ Already in group or could not resolve {val}")
-
-        except errors.FloodWaitError as fw:
-            sec = int(getattr(fw, "seconds", 60))
-            runtime["active_fw"] = sec
-            print(f"⏳ FloodWait {sec}s")
-            runtime["queue"].insert(0, item)  # requeue
-            await asyncio.sleep(sec + random.randint(5, 15))
-            runtime["active_fw"] = 0
-        except Exception as e:
-            print(f"❌ Join error {val}: {e}")
-
-        await _pause()
+        if added_id and added_id not in runtime["groups"]:
+            runtime["groups"].append(added_id)
+            save_runtime(phone, cfg)
+            print(f"✅ Joined and saved {added_id}")
+            return True
+    except Exception as e:
+        print(f"❌ Failed to join {val}: {e}")
+    return False
 
 
-async def _ensure_join_user(client, u: str):
-    ent = await client.get_entity(u)
-    if isinstance(ent, types.Channel):
-        try:
-            await client(functions.channels.JoinChannelRequest(ent))
-        except errors.UserAlreadyParticipantError:
-            pass
-    return ent
-
-
-async def _resolve_id(client, val: str):
-    try:
-        ent = await client.get_entity(val)
-        return getattr(ent, "id", None)
-    except Exception:
-        return None
+async def forward_cycle(client, phone: str, cfg: dict):
+    while True:
+        if runtime["groups"] and runtime["saved_msgs"]:
+            print(f"⏳ Cycle triggered, forwarding {len(runtime['saved_msgs'])} saved messages...")
+            for msg in runtime["saved_msgs"]:
+                for gid in runtime["groups"]:
+                    try:
+                        await msg.forward_to(gid)
+                        await asyncio.sleep(runtime["forward_delay"])
+                    except Exception as e:
+                        print(f"❌ Forward failed to {gid}: {e}")
+        await asyncio.sleep(runtime["cycle_minutes"] * 60)
 
 
 async def main(phone: str):
@@ -137,23 +115,32 @@ async def main(phone: str):
     client = TelegramClient(str(sess), cfg["api_id"], cfg["api_hash"])
     await client.start()
     me = await client.get_me()
+
+    if "groups" in cfg:
+        runtime["groups"] = cfg["groups"]
+    if "forward_delay" in cfg:
+        runtime["forward_delay"] = cfg["forward_delay"]
+    if "cycle_minutes" in cfg:
+        runtime["cycle_minutes"] = cfg["cycle_minutes"]
+
     print(f"✅ Runner started for {phone} ({me.first_name})")
 
     # --- Commands ---
     @client.on(events.NewMessage(pattern=r"^\.help$"))
     async def cmd_help(ev):
         await ev.reply(
-            ".help\n.status\n.info\n.time <m>\n.delay <s>\n"
-            ".addgroup <link|@user|id>\n.joinqueue\n.listgroups\n.delgroup <id>"
+            ".help\n.status\n.info\n.delay <s>\n.time <m>\n"
+            ".addgroup <link|@user|id>\n.listgroups\n.delgroup <id>\n"
+            "📌 Send messages to Saved Messages to include them in cycle"
         )
 
     @client.on(events.NewMessage(pattern=r"^\.status$"))
     async def cmd_status(ev):
         await ev.reply(
-            f"Queue: {len(runtime['queue'])}\n"
             f"Groups: {len(runtime['groups'])}\n"
+            f"Delay: {runtime['forward_delay']} sec\n"
             f"Cycle: {runtime['cycle_minutes']} min\n"
-            f"Delay: {runtime['forward_delay']} sec"
+            f"Saved messages: {len(runtime['saved_msgs'])}"
         )
 
     @client.on(events.NewMessage(pattern=r"^\.info$"))
@@ -161,25 +148,17 @@ async def main(phone: str):
         me = await client.get_me()
         await ev.reply(f"Phone: {cfg['phone']}\nUser: {me.first_name}\nID: {me.id}\nUsername: @{me.username}")
 
-    @client.on(events.NewMessage(pattern=r"^\.time\s+(.+)$"))
-    async def cmd_time(ev):
-        val = ev.pattern_match.group(1).lower()
-        m = re.match(r"(\d+)(m|min|minutes?)", val)
-        if not m:
-            await ev.reply("Usage: .time 10m")
-            return
-        runtime["cycle_minutes"] = int(m.group(1))
-        await ev.reply(f"Cycle set to {runtime['cycle_minutes']} min")
-
-    @client.on(events.NewMessage(pattern=r"^\.delay\s+(.+)$"))
+    @client.on(events.NewMessage(pattern=r"^\.delay\s+(\d+)$"))
     async def cmd_delay(ev):
-        val = ev.pattern_match.group(1).lower()
-        m = re.match(r"(\d+)(s|sec|seconds?)", val)
-        if not m:
-            await ev.reply("Usage: .delay 200s")
-            return
-        runtime["forward_delay"] = int(m.group(1))
+        runtime["forward_delay"] = int(ev.pattern_match.group(1))
+        save_runtime(phone, cfg)
         await ev.reply(f"Delay set to {runtime['forward_delay']} s")
+
+    @client.on(events.NewMessage(pattern=r"^\.time\s+(\d+)$"))
+    async def cmd_time(ev):
+        runtime["cycle_minutes"] = int(ev.pattern_match.group(1))
+        save_runtime(phone, cfg)
+        await ev.reply(f"Cycle interval set to {runtime['cycle_minutes']} min")
 
     @client.on(events.NewMessage(pattern=r"^\.listgroups$"))
     async def cmd_list(ev):
@@ -191,6 +170,7 @@ async def main(phone: str):
         gid = int(ev.pattern_match.group(1))
         if gid in runtime["groups"]:
             runtime["groups"].remove(gid)
+            save_runtime(phone, cfg)
             await ev.reply(f"Removed {gid}")
         else:
             await ev.reply("Not found.")
@@ -198,31 +178,37 @@ async def main(phone: str):
     @client.on(events.NewMessage(pattern=r"^\.addgroup\s+(.+)$"))
     async def cmd_add(ev):
         arg = ev.pattern_match.group(1).strip()
+        joined = 0
         if RE_FOLDER.search(arg):
             invites, users = await _fetch_folder(arg)
-            items = [{"kind": "invite", "value": h} for h in invites] + [{"kind": "username", "value": u} for u in users]
-            runtime["queue"].extend(items)
-            await ev.reply(f"Folder queued. {len(items)} items. Queue={len(runtime['queue'])}, ETA={_fmt(_eta(len(runtime['queue'])))}")
+            for h in invites:
+                if await _join_group(client, phone, "invite", h, cfg):
+                    joined += 1
+            for u in users:
+                if await _join_group(client, phone, "username", u, cfg):
+                    joined += 1
+            await ev.reply(f"📦 Folder added {joined} new groups.")
             return
         m_inv = RE_INVITE.search(arg)
         m_usr = RE_USERLN.search(arg)
         if m_inv:
-            runtime["queue"].append({"kind": "invite", "value": m_inv.group(1)})
+            ok = await _join_group(client, phone, "invite", m_inv.group(1), cfg)
         elif m_usr:
-            runtime["queue"].append({"kind": "username", "value": m_usr.group(1)})
+            ok = await _join_group(client, phone, "username", m_usr.group(1), cfg)
         elif arg.isdigit():
-            runtime["queue"].append({"kind": "entity_id", "value": arg})
+            ok = await _join_group(client, phone, "entity_id", arg, cfg)
         else:
-            runtime["queue"].append({"kind": "username", "value": arg.lstrip('@')})
-        await ev.reply(f"Queued. Size={len(runtime['queue'])}, ETA={_fmt(_eta(len(runtime['queue'])))}")
+            ok = await _join_group(client, phone, "username", arg.lstrip('@'), cfg)
+        await ev.reply("✅ Added group" if ok else "❌ Could not join")
 
-    @client.on(events.NewMessage(pattern=r"^\.joinqueue$"))
-    async def cmd_queue(ev):
-        q = len(runtime["queue"])
-        await ev.reply(f"Queue: {q} | ETA={_fmt(_eta(q))}")
+    # --- Forwarding from Saved Messages (store for cycle) ---
+    @client.on(events.NewMessage(chats="me"))
+    async def save_from_me(ev):
+        runtime["saved_msgs"].append(ev.message)
+        await ev.reply(f"💾 Message saved for cycle forward. Total saved: {len(runtime['saved_msgs'])}")
 
-    # start join worker
-    asyncio.create_task(_join_worker(client))
+    # start auto cycle forwarder
+    asyncio.create_task(forward_cycle(client, phone, cfg))
 
     await client.run_until_disconnected()
 
