@@ -4,6 +4,7 @@
 # - Saves groups & settings to users/<phone>.json (no duplicates)
 # - Forwards messages from Saved Messages to all groups
 # - Cycle forwarder: repeat all Saved Messages every X minutes with delay
+# - .clear command to reset saved messages
 
 import sys, json, asyncio, re
 from pathlib import Path
@@ -15,9 +16,9 @@ SESSIONS_DIR = Path("sessions")
 
 runtime = {
     "forward_delay": 5,
-    "cycle_minutes": 30,   # default 30m
+    "cycle_minutes": 30,
     "groups": [],
-    "saved_msgs": []       # stores ids of messages from Saved Messages
+    "saved_msgs": []
 }
 
 # regex
@@ -123,15 +124,21 @@ async def main(phone: str):
     if "cycle_minutes" in cfg:
         runtime["cycle_minutes"] = cfg["cycle_minutes"]
 
-    print(f"✅ Runner started for {phone} ({me.first_name})")
+    print(f"✅ Runner started for {me.first_name} (@{me.username})")
 
-    # --- Commands ---
     @client.on(events.NewMessage(pattern=r"^\.help$"))
     async def cmd_help(ev):
         await ev.reply(
-            ".help\n.status\n.info\n.delay <s>\n.time <m>\n"
-            ".addgroup <link|@user|id>\n.listgroups\n.delgroup <id>\n"
-            "📌 Send messages to Saved Messages to include them in cycle"
+            "➻ .help\n"
+            "➻ .status\n"
+            "➻ .info\n"
+            "➻ .delay <s>\n"
+            "➻ .time <m>\n"
+            "➻ .addgroup <link|@user|id>\n"
+            "➻ .listgroups\n"
+            "➻ .delgroup <id>\n"
+            "➻ .clear   (reset saved messages)\n\n"
+            "📌 Send messages to Saved Messages → included in cycle forward"
         )
 
     @client.on(events.NewMessage(pattern=r"^\.status$"))
@@ -146,7 +153,11 @@ async def main(phone: str):
     @client.on(events.NewMessage(pattern=r"^\.info$"))
     async def cmd_info(ev):
         me = await client.get_me()
-        await ev.reply(f"Phone: {cfg['phone']}\nUser: {me.first_name}\nID: {me.id}\nUsername: @{me.username}")
+        await ev.reply(
+            f"User: {me.first_name}\n"
+            f"Username: @{me.username}\n"
+            f"ID: {me.id}"
+        )
 
     @client.on(events.NewMessage(pattern=r"^\.delay\s+(\d+)$"))
     async def cmd_delay(ev):
@@ -201,13 +212,16 @@ async def main(phone: str):
             ok = await _join_group(client, phone, "username", arg.lstrip('@'), cfg)
         await ev.reply("✅ Added group" if ok else "❌ Could not join")
 
-    # --- Forwarding from Saved Messages (store for cycle) ---
+    @client.on(events.NewMessage(pattern=r"^\.clear$"))
+    async def cmd_clear(ev):
+        runtime["saved_msgs"] = []
+        await ev.reply("🗑️ Cleared all saved messages.")
+
     @client.on(events.NewMessage(chats="me"))
     async def save_from_me(ev):
         runtime["saved_msgs"].append(ev.message)
-        await ev.reply(f"💾 Message saved for cycle forward. Total saved: {len(runtime['saved_msgs'])}")
+        await ev.reply(f"💾 Saved for cycle forward. Total: {len(runtime['saved_msgs'])}")
 
-    # start auto cycle forwarder
     asyncio.create_task(forward_cycle(client, phone, cfg))
 
     await client.run_until_disconnected()
@@ -218,3 +232,4 @@ if __name__ == "__main__":
         print("Usage: python runner.py <phone>")
         sys.exit(1)
     asyncio.run(main(sys.argv[1]))
+    
