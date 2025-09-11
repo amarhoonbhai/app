@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-# Multi-user login CLI with better UX.
-# Features:
+# Multi-user login CLI with safety
 # - Login new user (with OTP prompt)
 # - Delete user (with confirmation)
 # - List users
 # - Start/Restart runner with logging
 # - Prevent duplicate runners
-# - Force IPv4 connection
+# - Force IPv4 for Telegram connection
 
 import sys, subprocess, json
 from pathlib import Path
@@ -92,11 +91,10 @@ def do_login():
     save_user(phone, api_id, api_hash)
 
     sess = session_path(phone)
-    # Force IPv4 with use_ipv6=False
+    # Force IPv4
     client = TelegramClient(str(sess), api_id, api_hash, use_ipv6=False)
 
     try:
-        # Start login manually to control OTP input
         client.connect()
         if not client.is_user_authorized():
             client.send_code_request(phone)
