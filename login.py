@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 # Multi-user login CLI with better UX.
-# After login, auto-starts runner in background.
+# Features:
+# - Login new user
+# - Delete user (with confirmation)
+# - List users
+# - Start/Restart runner with logging
+# - Prevent duplicate runners
 
 import sys, subprocess, json
 from pathlib import Path
 from telethon.sync import TelegramClient
 from telethon import errors
+
+# Optional: requires psutil for runner detection
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 USERS_DIR = Path("users")
 SESSIONS_DIR = Path("sessions")
@@ -19,10 +30,8 @@ RED = "\033[91m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
 
-
 def user_file(phone: str) -> Path:
     return USERS_DIR / f"{phone}.json"
-
 
 def save_user(phone: str, api_id: int, api_hash: str):
     f = user_file(phone)
@@ -31,7 +40,6 @@ def save_user(phone: str, api_id: int, api_hash: str):
         json.dump(data, fp, indent=2)
     print(f"{GREEN}✔ Saved user config: {f}{RESET}")
 
-
 def load_user(phone: str):
     f = user_file(phone)
     if not f.exists():
@@ -39,12 +47,25 @@ def load_user(phone: str):
     with open(f) as fp:
         return json.load(fp)
 
-
 def session_path(phone: str) -> Path:
     return SESSIONS_DIR / f"{phone}.session"
 
+def is_runner_running(phone: str) -> bool:
+    """Check if runner.py is already running for this phone"""
+    if not psutil:
+        return False
+    for proc in psutil.process_iter(["cmdline"]):
+        try:
+            if proc.info["cmdline"] and "runner.py" in proc.info["cmdline"] and phone in proc.info["cmdline"]:
+                return True
+        except Exception:
+            continue
+    return False
 
-def start_runner(phone: str):
+def start_runner(phone: str, restart=False):
+    if is_runner_running(phone) and not restart:
+        print(f"{RED}✘ Runner already running for {phone}{RESET}")
+        return
     log_file = LOGS_DIR / f"runner_{phone}.log"
     with open(log_file, "a") as lf:
         subprocess.Popen(
@@ -55,11 +76,17 @@ def start_runner(phone: str):
         )
     print(f"{GREEN}✔ Runner started for {phone}. Logs: {log_file}{RESET}")
 
-
 def do_login():
     print(f"\n{CYAN}➻ LOGIN PROCESS{RESET}")
     phone = input("Enter phone (+countrycode): ").strip()
-    api_id = int(input("Enter API_ID: ").strip())
+    if user_file(phone).exists():
+        print(f"{RED}✘ User already exists{RESET}")
+        return
+    try:
+        api_id = int(input("Enter API_ID: ").strip())
+    except ValueError:
+        print(f"{RED}✘ Invalid API_ID{RESET}")
+        return
     api_hash = input("Enter API_HASH: ").strip()
     save_user(phone, api_id, api_hash)
 
@@ -71,18 +98,6 @@ def do_login():
         print(f"{GREEN}✔ Logged in as {me.first_name} (@{me.username}) id={me.id}{RESET}")
         client.disconnect()
         start_runner(phone)   # auto-run background
-        print(
-            f"\n{CYAN}➻ Now you can use these commands in Telegram:{RESET}\n"
-            "  ➻ .addgroup <link>   → instantly join groups (folder links supported)\n"
-            "  ➻ .listgroups        → list groups\n"
-            "  ➻ .delgroup <id>     → remove group\n"
-            "  ➻ .delay <s>         → set forward delay\n"
-            "  ➻ .time <m>          → set cycle interval\n"
-            "  ➻ .status / .info    → check status or info\n"
-            "  ➻ .help              → show help menu\n"
-            "  ➻ .clear             → clear all saved messages\n\n"
-            "📌 Send any message to Saved Messages → it will be forwarded each cycle."
-        )
     except errors.ApiIdInvalidError:
         print(f"{RED}✘ Invalid API_ID/API_HASH{RESET}")
     except errors.PhoneCodeInvalidError:
@@ -92,10 +107,13 @@ def do_login():
     except Exception as e:
         print(f"{RED}✘ Login failed: {e}{RESET}")
 
-
 def do_delete():
     print(f"\n{CYAN}➻ DELETE USER{RESET}")
     phone = input("Enter phone to delete: ").strip()
+    confirm = input(f"Type 'YES' to confirm delete {phone}: ")
+    if confirm != "YES":
+        print(f"{RED}✘ Cancelled{RESET}")
+        return
     deleted = False
     if session_path(phone).exists():
         session_path(phone).unlink()
@@ -108,25 +126,41 @@ def do_delete():
     if not deleted:
         print(f"{RED}✘ No session/config found for {phone}{RESET}")
 
+def list_users():
+    users = [f.stem for f in USERS_DIR.glob("*.json")]
+    if not users:
+        print(f"{RED}✘ No users found{RESET}")
+    else:
+        print(f"{CYAN}Users:{RESET}")
+        for u in users:
+            print(f" - {u}")
+
+def restart_runner():
+    phone = input("Enter phone to restart runner: ").strip()
+    start_runner(phone, restart=True)
 
 def menu():
     while True:
         print(f"\n{CYAN}==== Telegram Forwarder CLI ===={RESET}")
         print("  [1] Login (new user, auto-runner)")
         print("  [2] Delete user")
-        print("  [3] Exit")
+        print("  [3] List users")
+        print("  [4] Restart runner")
+        print("  [5] Exit")
         choice = input("➻ Choose option: ").strip()
         if choice == "1":
             do_login()
         elif choice == "2":
             do_delete()
         elif choice == "3":
+            list_users()
+        elif choice == "4":
+            restart_runner()
+        elif choice == "5":
             print(f"{CYAN}Exiting...{RESET}")
             break
         else:
             print(f"{RED}✘ Invalid choice{RESET}")
 
-
 if __name__ == "__main__":
     menu()
-    
