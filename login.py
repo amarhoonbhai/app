@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # Multi-user login CLI with better UX.
 # Features:
-# - Login new user
+# - Login new user (with OTP prompt)
 # - Delete user (with confirmation)
 # - List users
 # - Start/Restart runner with logging
 # - Prevent duplicate runners
+# - Force IPv4 connection
 
 import sys, subprocess, json
 from pathlib import Path
@@ -91,9 +92,21 @@ def do_login():
     save_user(phone, api_id, api_hash)
 
     sess = session_path(phone)
-    client = TelegramClient(str(sess), api_id, api_hash)
+    # Force IPv4 with use_ipv6=False
+    client = TelegramClient(str(sess), api_id, api_hash, use_ipv6=False)
+
     try:
-        client.start(phone=lambda: phone)
+        # Start login manually to control OTP input
+        client.connect()
+        if not client.is_user_authorized():
+            client.send_code_request(phone)
+            code = input("Enter the code you received: ").strip()
+            try:
+                client.sign_in(phone, code)
+            except errors.SessionPasswordNeededError:
+                pw = input("Two-step password enabled. Enter your password: ").strip()
+                client.sign_in(password=pw)
+
         me = client.get_me()
         print(f"{GREEN}✔ Logged in as {me.first_name} (@{me.username}) id={me.id}{RESET}")
         client.disconnect()
@@ -164,3 +177,4 @@ def menu():
 
 if __name__ == "__main__":
     menu()
+    
