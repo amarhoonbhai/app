@@ -1,4 +1,4 @@
-# runner.py — Saved -> groups with per-message delay, per-forward gap, rotation, autonight
+# runner.py — Self-anywhere commands; Saved-only forwarding
 import asyncio, json, os, atexit
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -13,7 +13,7 @@ SESS_DIR = Path("sessions"); SESS_DIR.mkdir(exist_ok=True)
 RUNNER_PID = Path("runner.pid")
 
 LOCAL_TZ = pytz.timezone("Asia/Kolkata")
-DEFAULT_AUTONIGHT = ("23:00", "07:00")  # used if .autonight on and no .quiet set
+DEFAULT_AUTONIGHT = ("23:00", "07:00")
 
 # ---------- PID ----------
 def _write_pid(): RUNNER_PID.write_text(str(os.getpid()))
@@ -58,7 +58,6 @@ def in_quiet_window(quiet_start: str|None, quiet_end: str|None) -> bool:
     return (s <= now < e) if s < e else (now >= s or now < e)
 
 async def resolve_target(client: TelegramClient, target: str):
-    """Supports @username, -100.. chat id, t.me/+invite, t.me/joinchat/..., or 'me'."""
     t = target.strip()
     try:
         if t in ("me","self","saved","saved_messages"):
@@ -80,15 +79,16 @@ async def start_user(cfg_path: Path):
     phone = cfg["phone"]
     client = TelegramClient(str(SESS_DIR / phone), int(cfg["api_id"]), cfg["api_hash"])
     await client.start(phone=phone)
+
     me = await client.get_me()
     my_saved = await client.get_input_entity("me")
 
     # state
-    interval_s = {"v": int(cfg.get("send_interval_seconds", 30))}     # .time (sleep after each message)
-    forward_gap_s = {"v": int(cfg.get("forward_gap_seconds", 2))}      # .gap (between group forwards)
-    quiet = {"s": cfg.get("quiet_start"), "e": cfg.get("quiet_end")}    # .quiet
-    autonight = {"v": bool(cfg.get("autonight", False))}                # .autonight
-    rotation_mode = {"v": cfg.get("rotation_mode", "broadcast")}        # 'broadcast' or 'roundrobin'
+    interval_s = {"v": int(cfg.get("send_interval_seconds", 30))}
+    forward_gap_s = {"v": int(cfg.get("forward_gap_seconds", 2))}
+    quiet = {"s": cfg.get("quiet_start"), "e": cfg.get("quiet_end")}
+    autonight = {"v": bool(cfg.get("autonight", False))}
+    rotation_mode = {"v": cfg.get("rotation_mode", "broadcast")}  # 'broadcast' or 'roundrobin'
     rot_index = {"v": int(cfg.get("rot_index", 0))}
 
     # targets
@@ -115,7 +115,7 @@ async def start_user(cfg_path: Path):
             s, e = DEFAULT_AUTONIGHT
         return in_quiet_window(s, e)
 
-    # queue worker (take message -> send according to mode -> sleep .time)
+    # queue worker
     q: asyncio.Queue = asyncio.Queue()
 
     async def worker():
@@ -141,7 +141,6 @@ async def start_user(cfg_path: Path):
                         rot_index["v"] = (rot_index["v"] + 1) % max(1, len(targets))
                         cfg["rot_index"] = rot_index["v"]; save_cfg(cfg_path, cfg)
                     else:
-                        # broadcast to all with gap between
                         for i, t in enumerate(targets):
                             try:
                                 await client.forward_messages(t, msg)
@@ -155,7 +154,6 @@ async def start_user(cfg_path: Path):
                             if i < len(targets)-1 and forward_gap_s["v"] > 0:
                                 await asyncio.sleep(forward_gap_s["v"])
 
-                    # sleep once per message (queue pacing)
                     if interval_s["v"] > 0:
                         await asyncio.sleep(interval_s["v"])
             finally:
@@ -163,11 +161,9 @@ async def start_user(cfg_path: Path):
 
     asyncio.create_task(worker())
 
-    # -------- Saved Messages listener --------
-    @client.on(events.NewMessage(chats=my_saved))
-    async def saved_handler(ev):
-        raw = ev.raw_text or ""
-        low = raw.strip().lower()
+    # ---------- command processor (shared) ----------
+    async def process_command(ev, raw: str):
+        low = (raw or "").strip().lower()
 
         if low.startswith(".addgroup"):
             parts = raw.split(maxsplit=1)
@@ -186,7 +182,7 @@ async def start_user(cfg_path: Path):
                 await ev.reply(" | ".join(msg) if msg else "(no changes)")
             else:
                 await ev.reply("Usage: .addgroup @g1,@g2,-100..., t.me/+invite")
-            return
+            return True
 
         if low.startswith(".delgroup"):
             parts = raw.split(maxsplit=1)
@@ -195,7 +191,6 @@ async def start_user(cfg_path: Path):
                 keep = [s for s in targets_cfg if s not in items]
                 if len(keep) != len(targets_cfg):
                     targets_cfg[:] = keep
-                    # rebuild entities
                     new_entities = []
                     for s in targets_cfg:
                         e = await resolve_target(client, s)
@@ -207,7 +202,7 @@ async def start_user(cfg_path: Path):
                     await ev.reply("(no changes)")
             else:
                 await ev.reply("Usage: .delgroup @g1,-100...")
-            return
+            return True
 
         if low.startswith(".listgroups"):
             if targets_cfg:
@@ -215,7 +210,7 @@ async def start_user(cfg_path: Path):
                 await ev.reply("📜 groups:\n" + body)
             else:
                 await ev.reply("📜 groups: (empty)")
-            return
+            return True
 
         if low.startswith(".time"):
             parts = raw.split(maxsplit=1)
@@ -223,7 +218,7 @@ async def start_user(cfg_path: Path):
             interval_s["v"] = secs
             cfg["send_interval_seconds"] = secs; save_cfg(cfg_path, cfg)
             await ev.reply(f"⏱ per-message interval = {secs}s")
-            return
+            return True
 
         if low.startswith(".gap"):
             parts = raw.split(maxsplit=1)
@@ -231,7 +226,7 @@ async def start_user(cfg_path: Path):
             forward_gap_s["v"] = secs
             cfg["forward_gap_seconds"] = secs; save_cfg(cfg_path, cfg)
             await ev.reply(f"↔️ gap between forwards = {secs}s")
-            return
+            return True
 
         if low.startswith(".rotate"):
             parts = raw.split(maxsplit=1)
@@ -242,7 +237,7 @@ async def start_user(cfg_path: Path):
                 await ev.reply(f"🔁 rotation = {mode} ({rotation_mode['v']})")
             else:
                 await ev.reply("Usage: .rotate on | .rotate off")
-            return
+            return True
 
         if low.startswith(".autonight"):
             parts = raw.split(maxsplit=1)
@@ -255,7 +250,7 @@ async def start_user(cfg_path: Path):
                 await ev.reply(f"🌙 autonight = {autonight['v']} (quiet {s}–{e})")
             else:
                 await ev.reply("Usage: .autonight on | .autonight off")
-            return
+            return True
 
         if low.startswith(".quiet"):
             parts = raw.split(maxsplit=1)
@@ -272,7 +267,7 @@ async def start_user(cfg_path: Path):
                     await ev.reply(f"🔕 quiet hours set {s}-{e}")
                 else:
                     await ev.reply("Format: .quiet 23:00-07:00  or  .quiet off")
-            return
+            return True
 
         if low.startswith(".status"):
             s = quiet["s"] or DEFAULT_AUTONIGHT[0]
@@ -285,7 +280,7 @@ async def start_user(cfg_path: Path):
                 f"• autonight: {autonight['v']} (quiet {s}–{e})\n"
                 f"• groups: {', '.join(targets_cfg) if targets_cfg else '—'}"
             )
-            return
+            return True
 
         if low.startswith(".help"):
             await ev.reply(
@@ -293,19 +288,36 @@ async def start_user(cfg_path: Path):
                 "• .addgroup @g1,@g2,-100..., t.me/+invite\n"
                 "• .delgroup @g1,-100...\n"
                 "• .listgroups\n"
-                "• .time 30m              (sleep after each message)\n"
-                "• .gap 5s                (delay between each group in broadcast)\n"
-                "• .rotate on|off         (round-robin vs broadcast)\n"
+                "• .time 30m\n"
+                "• .gap 5s\n"
+                "• .rotate on|off\n"
                 "• .quiet 23:00-07:00 | .quiet off\n"
-                "• .autonight on|off      (uses .quiet else 23:00–07:00)\n"
+                "• .autonight on|off\n"
                 "• .status"
             )
-            return
+            return True
 
-        # normal flow: any other Saved message -> queue
+        return False  # not a command
+
+    # ---------- handler A: commands from YOU anywhere ----------
+    @client.on(events.NewMessage(from_users=lambda u: u and u.is_self))
+    async def commands_anywhere(ev):
+        raw = ev.raw_text or ""
+        if (raw.strip() or "").startswith("."):
+            handled = await process_command(ev, raw)
+            if handled:
+                return  # don't fall through
+
+    # ---------- handler B: Saved Messages forwarding (non-commands only) ----------
+    @client.on(events.NewMessage(chats=my_saved))
+    async def saved_forwarder(ev):
+        raw = ev.raw_text or ""
+        if (raw.strip() or "").startswith("."):
+            await process_command(ev, raw)  # allow commands in Saved too
+            return
         await q.put(ev.message)
 
-    print(f"[{phone}] listening to Saved Messages. Drop anything there to forward.")
+    print(f"[{phone}] listening… Commands: YOU anywhere | Forwarding: Saved Messages only.")
     await client.run_until_disconnected()
 
 # ---------- run all users ----------
@@ -321,3 +333,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
