@@ -1,336 +1,153 @@
-# runner.py — Self-anywhere commands; Saved-only forwarding
-import asyncio, json, os, atexit
-from datetime import datetime, time as dtime
-from pathlib import Path
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
 
-import pytz
-from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon import TelegramClient
 
-CONFIG_DIR = Path("users")
-SESS_DIR = Path("sessions"); SESS_DIR.mkdir(exist_ok=True)
-RUNNER_PID = Path("runner.pid")
+USERS_DIR = "users"
+SESS_DIR = "sessions"
+os.makedirs(USERS_DIR, exist_ok=True)
+os.makedirs(SESS_DIR, exist_ok=True)
 
-LOCAL_TZ = pytz.timezone("Asia/Kolkata")
-DEFAULT_AUTONIGHT = ("23:00", "07:00")
+MENU = """
+==== Telegram Forwarder CLI ====
+  [1] Login (new user, auto-runner)
+  [2] Delete user
+  [3] List users
+  [4] Restart runner
+  [5] Set/Show Expire Date (default 2026-01-10)
+  [6] Exit
+"""
 
-# ---------- PID ----------
-def _write_pid(): RUNNER_PID.write_text(str(os.getpid()))
-def _cleanup_pid():
-    try: RUNNER_PID.unlink(missing_ok=True)
-    except Exception: pass
-_write_pid(); atexit.register(_cleanup_pid)
+DEFAULT = {
+    "targets": [],
+    "interval_seconds": 30,
+    "gap_seconds": 5,
+    "mode": "rotation",
+    "quiet": {"enabled": True, "start": "23:00", "end": "07:00"},
+    "expire_date": "2026-01-10",
+    "rot_index": 0
+}
 
-# ---------- utils ----------
-def load_cfg(path: Path):
-    with open(path, "r", encoding="utf-8") as f: return json.load(f)
-def save_cfg(path: Path, cfg: dict):
-    with open(path, "w", encoding="utf-8") as f: json.dump(cfg, f, indent=2, ensure_ascii=False)
+def user_cfg_path(phone: str) -> str:
+    return os.path.join(USERS_DIR, f"{phone}.json")
 
-def parse_interval(text: str) -> int:
-    t = (text or "").strip().lower().replace(" ", "")
-    if not t: return 0
-    total = 0; num = ""; last = "s"; i = 0
-    def add(v,u):
-        nonlocal total
-        if u=="s": total += v
-        elif u=="m": total += v*60
-        elif u=="h": total += v*3600
-        elif u=="d": total += v*86400
-    while i < len(t):
-        c = t[i]
-        if c.isdigit(): num += c; i += 1; continue
-        if t[i:].startswith(("sec","s")): u="s"; i += 3 if t[i:].startswith("sec") else 1
-        elif t[i:].startswith(("min","m")): u="m"; i += 3 if t[i:].startswith("min") else 1
-        elif t[i:].startswith(("hour","h")): u="h"; i += 4 if t[i:].startswith("hour") else 1
-        elif t[i:].startswith(("day","d")): u="d"; i += 3 if t[i:].startswith("day") else 1
-        else: u = last; i += 1
-        add(int(num) if num else 0, u); last = u; num = ""
-    if num: add(int(num), "s")
-    return total
+def start_runner(cfg_path: str):
+    print(f"▶ Starting runner for {cfg_path}")
+    subprocess.Popen([sys.executable, "runner.py", cfg_path],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
-def in_quiet_window(quiet_start: str|None, quiet_end: str|None) -> bool:
-    if not quiet_start or not quiet_end: return False
-    now = datetime.now(LOCAL_TZ).time()
-    def _p(t): hh, mm = t.split(":"); return dtime(int(hh), int(mm))
-    s, e = _p(quiet_start), _p(quiet_end)
-    return (s <= now < e) if s < e else (now >= s or now < e)
+def login_flow():
+    phone = input("Enter phone (+countrycode): ").strip()
+    api_id = int(input("Enter API_ID: ").strip())
+    api_hash = input("Enter API_HASH: ").strip()
 
-async def resolve_target(client: TelegramClient, target: str):
-    t = target.strip()
-    try:
-        if t in ("me","self","saved","saved_messages"):
-            return await client.get_entity("me")
-        if "t.me/+" in t or "t.me/joinchat/" in t:
-            plus = t.split("+", 1)[-1] if "+" in t else t.rstrip("/").split("/", 3)[-1]
-            await client(ImportChatInviteRequest(plus))
-        return await client.get_entity(t)
-    except Exception:
+    session_name = os.path.join(SESS_DIR, phone)
+    client = TelegramClient(session_name, api_id, api_hash)
+
+    print("Connecting…")
+    client.connect()
+    if not client.is_user_authorized():
+        client.send_code_request(phone)
+        code = input("Enter the code you received: ").strip()
         try:
-            return await client.get_entity(int(t))
+            client.sign_in(phone, code)
         except Exception as e:
-            print(f"[warn] cannot resolve '{t}': {e}")
-            return None
+            # 2FA password, if enabled
+            if "SESSION_PASSWORD_NEEDED" in str(e):
+                pwd = input("Enter your 2FA password: ").strip()
+                client.sign_in(password=pwd)
+            else:
+                raise
+    client.disconnect()
 
-# ---------- per-user ----------
-async def start_user(cfg_path: Path):
-    cfg = load_cfg(cfg_path)
-    phone = cfg["phone"]
-    client = TelegramClient(str(SESS_DIR / phone), int(cfg["api_id"]), cfg["api_hash"])
-    await client.start(phone=phone)
+    cfg = {
+        **DEFAULT,
+        "phone": phone,
+        "api_id": api_id,
+        "api_hash": api_hash,
+    }
+    with open(user_cfg_path(phone), "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"✔ Saved user config: {user_cfg_path(phone)}")
 
-    me = await client.get_me()
-    my_saved = await client.get_input_entity("me")
+    start_runner(user_cfg_path(phone))
 
-    # state
-    interval_s = {"v": int(cfg.get("send_interval_seconds", 30))}
-    forward_gap_s = {"v": int(cfg.get("forward_gap_seconds", 2))}
-    quiet = {"s": cfg.get("quiet_start"), "e": cfg.get("quiet_end")}
-    autonight = {"v": bool(cfg.get("autonight", False))}
-    rotation_mode = {"v": cfg.get("rotation_mode", "broadcast")}  # 'broadcast' or 'roundrobin'
-    rot_index = {"v": int(cfg.get("rot_index", 0))}
+def delete_user():
+    phone = input("Phone to delete (+countrycode): ").strip()
+    cfg = user_cfg_path(phone)
+    sess = os.path.join(SESS_DIR, phone + ".session")
+    for p in [cfg, sess]:
+        try:
+            os.remove(p)
+            print(f"🗑️ Deleted {p}")
+        except FileNotFoundError:
+            pass
 
-    # targets
-    targets_cfg = list(cfg.get("targets", []))
-    targets = []
-    for t in targets_cfg:
-        e = await resolve_target(client, t)
-        if e: targets.append(e)
-
-    print(f"[{phone}] logged in as {me.first_name} ({me.id})")
-    print(f"[{phone}] interval={interval_s['v']}s | gap={forward_gap_s['v']}s | mode={rotation_mode['v']} | autonight={autonight['v']} | quiet={quiet['s']}→{quiet['e']}")
-    await client.send_message(
-        my_saved,
-        f"✅ Online.\n"
-        f"Interval: {interval_s['v']}s | Gap: {forward_gap_s['v']}s\n"
-        f"Mode: {rotation_mode['v']} | Autonight: {autonight['v']} "
-        f"(quiet {quiet['s'] or DEFAULT_AUTONIGHT[0]}–{quiet['e'] or DEFAULT_AUTONIGHT[1]})\n"
-        f"Targets: {', '.join(targets_cfg) if targets_cfg else '—'}"
-    )
-
-    def quiet_active() -> bool:
-        s, e = quiet["s"], quiet["e"]
-        if autonight["v"] and (not s or not e):
-            s, e = DEFAULT_AUTONIGHT
-        return in_quiet_window(s, e)
-
-    # queue worker
-    q: asyncio.Queue = asyncio.Queue()
-
-    async def worker():
-        while True:
-            msg = await q.get()
+def list_users():
+    print("Users:")
+    for f in os.listdir(USERS_DIR):
+        if f.endswith(".json"):
+            path = os.path.join(USERS_DIR, f)
             try:
-                if quiet_active():
-                    print(f"[{phone}] quiet hours — skipped 1 message.")
-                elif not targets:
-                    print(f"[{phone}] no targets set; message skipped.")
-                else:
-                    if rotation_mode["v"] == "roundrobin":
-                        t = targets[rot_index["v"] % len(targets)]
-                        try:
-                            await client.forward_messages(t, msg)
-                            print(f"[{phone}] RR sent -> {t}")
-                        except FloodWaitError as e:
-                            print(f"[{phone}] FloodWait {e.seconds}s; sleeping…")
-                            await asyncio.sleep(e.seconds + 1)
-                            await client.forward_messages(t, msg)
-                        except Exception as e:
-                            print(f"[{phone}] error -> {t}: {e}")
-                        rot_index["v"] = (rot_index["v"] + 1) % max(1, len(targets))
-                        cfg["rot_index"] = rot_index["v"]; save_cfg(cfg_path, cfg)
-                    else:
-                        for i, t in enumerate(targets):
-                            try:
-                                await client.forward_messages(t, msg)
-                                print(f"[{phone}] sent -> {t}")
-                            except FloodWaitError as e:
-                                print(f"[{phone}] FloodWait {e.seconds}s; sleeping…")
-                                await asyncio.sleep(e.seconds + 1)
-                                await client.forward_messages(t, msg)
-                            except Exception as e:
-                                print(f"[{phone}] error -> {t}: {e}")
-                            if i < len(targets)-1 and forward_gap_s["v"] > 0:
-                                await asyncio.sleep(forward_gap_s["v"])
+                with open(path) as fp:
+                    cfg = json.load(fp)
+                print(f" - {f[:-5]} | expire={cfg.get('expire_date','')}")
+            except Exception:
+                print(f" - {f[:-5]} (invalid json)")
 
-                    if interval_s["v"] > 0:
-                        await asyncio.sleep(interval_s["v"])
-            finally:
-                q.task_done()
-
-    asyncio.create_task(worker())
-
-    # ---------- command processor (shared) ----------
-    async def process_command(ev, raw: str):
-        low = (raw or "").strip().lower()
-
-        if low.startswith(".addgroup"):
-            parts = raw.split(maxsplit=1)
-            if len(parts) > 1:
-                items = [s for s in parts[1].replace(" ", "").split(",") if s]
-                added, bad = [], []
-                for it in items:
-                    if it in targets_cfg: continue
-                    e = await resolve_target(client, it)
-                    if e: targets.append(e); targets_cfg.append(it); added.append(it)
-                    else: bad.append(it)
-                cfg["targets"] = targets_cfg; save_cfg(cfg_path, cfg)
-                msg = []
-                if added: msg.append(f"✅ added: {', '.join(added)}")
-                if bad:   msg.append(f"⚠️ failed: {', '.join(bad)}")
-                await ev.reply(" | ".join(msg) if msg else "(no changes)")
-            else:
-                await ev.reply("Usage: .addgroup @g1,@g2,-100..., t.me/+invite")
-            return True
-
-        if low.startswith(".delgroup"):
-            parts = raw.split(maxsplit=1)
-            if len(parts) > 1:
-                items = [s for s in parts[1].replace(" ", "").split(",") if s]
-                keep = [s for s in targets_cfg if s not in items]
-                if len(keep) != len(targets_cfg):
-                    targets_cfg[:] = keep
-                    new_entities = []
-                    for s in targets_cfg:
-                        e = await resolve_target(client, s)
-                        if e: new_entities.append(e)
-                    targets[:] = new_entities
-                    cfg["targets"] = targets_cfg; save_cfg(cfg_path, cfg)
-                    await ev.reply(f"🧹 removed: {', '.join(items)}")
-                else:
-                    await ev.reply("(no changes)")
-            else:
-                await ev.reply("Usage: .delgroup @g1,-100...")
-            return True
-
-        if low.startswith(".listgroups"):
-            if targets_cfg:
-                body = "\n".join(f"{i+1}. {s}" for i, s in enumerate(targets_cfg))
-                await ev.reply("📜 groups:\n" + body)
-            else:
-                await ev.reply("📜 groups: (empty)")
-            return True
-
-        if low.startswith(".time"):
-            parts = raw.split(maxsplit=1)
-            secs = parse_interval(parts[1]) if len(parts) > 1 else 0
-            interval_s["v"] = secs
-            cfg["send_interval_seconds"] = secs; save_cfg(cfg_path, cfg)
-            await ev.reply(f"⏱ per-message interval = {secs}s")
-            return True
-
-        if low.startswith(".gap"):
-            parts = raw.split(maxsplit=1)
-            secs = parse_interval(parts[1]) if len(parts) > 1 else 0
-            forward_gap_s["v"] = secs
-            cfg["forward_gap_seconds"] = secs; save_cfg(cfg_path, cfg)
-            await ev.reply(f"↔️ gap between forwards = {secs}s")
-            return True
-
-        if low.startswith(".rotate"):
-            parts = raw.split(maxsplit=1)
-            mode = (parts[1].strip().lower() if len(parts)>1 else "on")
-            if mode in ("on","off"):
-                rotation_mode["v"] = "roundrobin" if mode == "on" else "broadcast"
-                cfg["rotation_mode"] = rotation_mode["v"]; save_cfg(cfg_path, cfg)
-                await ev.reply(f"🔁 rotation = {mode} ({rotation_mode['v']})")
-            else:
-                await ev.reply("Usage: .rotate on | .rotate off")
-            return True
-
-        if low.startswith(".autonight"):
-            parts = raw.split(maxsplit=1)
-            onoff = (parts[1].strip().lower() if len(parts)>1 else "on")
-            if onoff in ("on","off"):
-                autonight["v"] = (onoff == "on")
-                cfg["autonight"] = autonight["v"]; save_cfg(cfg_path, cfg)
-                s = quiet["s"] or DEFAULT_AUTONIGHT[0]
-                e = quiet["e"] or DEFAULT_AUTONIGHT[1]
-                await ev.reply(f"🌙 autonight = {autonight['v']} (quiet {s}–{e})")
-            else:
-                await ev.reply("Usage: .autonight on | .autonight off")
-            return True
-
-        if low.startswith(".quiet"):
-            parts = raw.split(maxsplit=1)
-            if len(parts)==1 or parts[1].strip().lower()=="off":
-                quiet["s"]=quiet["e"]=None
-                cfg["quiet_start"]=cfg["quiet_end"]=None; save_cfg(cfg_path, cfg)
-                await ev.reply("🔕 quiet hours disabled")
-            else:
-                rng = parts[1].replace(" ", "")
-                if "-" in rng:
-                    s,e = rng.split("-",1)
-                    quiet["s"], quiet["e"] = s, e
-                    cfg["quiet_start"], cfg["quiet_end"] = s, e; save_cfg(cfg_path, cfg)
-                    await ev.reply(f"🔕 quiet hours set {s}-{e}")
-                else:
-                    await ev.reply("Format: .quiet 23:00-07:00  or  .quiet off")
-            return True
-
-        if low.startswith(".status"):
-            s = quiet["s"] or DEFAULT_AUTONIGHT[0]
-            e = quiet["e"] or DEFAULT_AUTONIGHT[1]
-            await ev.reply(
-                "🟢 status:\n"
-                f"• per-message interval: {interval_s['v']}s\n"
-                f"• gap between forwards: {forward_gap_s['v']}s\n"
-                f"• rotation: {rotation_mode['v']}\n"
-                f"• autonight: {autonight['v']} (quiet {s}–{e})\n"
-                f"• groups: {', '.join(targets_cfg) if targets_cfg else '—'}"
-            )
-            return True
-
-        if low.startswith(".help"):
-            await ev.reply(
-                "Commands:\n"
-                "• .addgroup @g1,@g2,-100..., t.me/+invite\n"
-                "• .delgroup @g1,-100...\n"
-                "• .listgroups\n"
-                "• .time 30m\n"
-                "• .gap 5s\n"
-                "• .rotate on|off\n"
-                "• .quiet 23:00-07:00 | .quiet off\n"
-                "• .autonight on|off\n"
-                "• .status"
-            )
-            return True
-
-        return False  # not a command
-
-    # ---------- handler A: commands from YOU anywhere ----------
-    @client.on(events.NewMessage(from_users=lambda u: u and u.is_self))
-    async def commands_anywhere(ev):
-        raw = ev.raw_text or ""
-        if (raw.strip() or "").startswith("."):
-            handled = await process_command(ev, raw)
-            if handled:
-                return  # don't fall through
-
-    # ---------- handler B: Saved Messages forwarding (non-commands only) ----------
-    @client.on(events.NewMessage(chats=my_saved))
-    async def saved_forwarder(ev):
-        raw = ev.raw_text or ""
-        if (raw.strip() or "").startswith("."):
-            await process_command(ev, raw)  # allow commands in Saved too
-            return
-        await q.put(ev.message)
-
-    print(f"[{phone}] listening… Commands: YOU anywhere | Forwarding: Saved Messages only.")
-    await client.run_until_disconnected()
-
-# ---------- run all users ----------
-async def main():
-    cfgs = list(CONFIG_DIR.glob("*.json"))
-    if not cfgs:
-        print("No users configured. Run: python3 login.py")
+def restart_runner():
+    phone = input("Phone to restart: ").strip()
+    cfg = user_cfg_path(phone)
+    if not os.path.exists(cfg):
+        print("No such user.")
         return
-    await asyncio.gather(*(start_user(p) for p in cfgs))
+    start_runner(cfg)
+
+def set_or_show_expiry():
+    phone = input("Phone to set/show expiry: ").strip()
+    cfg_path = user_cfg_path(phone)
+    if not os.path.exists(cfg_path):
+        print("No such user.")
+        return
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    cur = cfg.get("expire_date", "2026-01-10")
+    print(f"Current expire date: {cur}")
+    newv = input("Enter new date YYYY-MM-DD (leave blank to keep): ").strip()
+    if newv:
+        try:
+            datetime.strptime(newv, "%Y-%m-%d")
+        except ValueError:
+            print("Invalid date format.")
+            return
+        cfg["expire_date"] = newv
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"✔ Updated expire date to {newv}")
+
+def main():
+    while True:
+        print(MENU)
+        choice = input("➻ Choose option: ").strip()
+        if choice == "1":
+            login_flow()
+        elif choice == "2":
+            delete_user()
+        elif choice == "3":
+            list_users()
+        elif choice == "4":
+            restart_runner()
+        elif choice == "5":
+            set_or_show_expiry()
+        elif choice == "6":
+            print("Bye.")
+            break
+        else:
+            print("Invalid choice.")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-
+    main()
+    
