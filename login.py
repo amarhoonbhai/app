@@ -1,194 +1,166 @@
-# login.py — minimal menu: Add user (OTP), Delete user, Exit
-import asyncio
 import json
 import os
 import subprocess
 import sys
-from getpass import getpass
-from pathlib import Path
+from datetime import datetime
 
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.errors import SessionPasswordNeededError
 
-# ---- paths ----
-CONFIG_DIR = Path("users"); CONFIG_DIR.mkdir(exist_ok=True)
-SESS_DIR = Path("sessions"); SESS_DIR.mkdir(exist_ok=True)
-RUNNER_PID = Path("runner.pid")
+USERS_DIR = "users"
+SESS_DIR = "sessions"
+os.makedirs(USERS_DIR, exist_ok=True)
+os.makedirs(SESS_DIR, exist_ok=True)
 
-# ---- default config template (other fields used by runner.py) ----
-TEMPLATE = {
-    "phone": "",
-    "api_id": 0,
-    "api_hash": "",
+MENU = """
+==== Telegram Forwarder CLI ====
+  [1] Login (new user, auto-runner)
+  [2] Delete user
+  [3] List users
+  [4] Restart runner
+  [5] Set/Show Expire Date (default 2026-01-10)
+  [6] Exit
+"""
+
+DEFAULT_CFG = {
     "targets": [],
-    "send_interval_seconds": 30,
-    "forward_gap_seconds": 2,
-    "quiet_start": None,
-    "quiet_end": None,
-    "autonight": False,
-    "rotation_mode": "broadcast",
+    "interval_seconds": 30,                 # interval between Saved-message jobs
+    "gap_seconds": 5,                       # delay between targets in broadcast mode
+    "mode": "rotation",                     # rotation | broadcast
+    "quiet": {"enabled": True, "start": "23:00", "end": "07:00"},
+    "expire_date": "2026-01-10",            # default expiry
     "rot_index": 0,
 }
 
-# ==== runner helpers ====
-def _alive_pid(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
+def user_cfg_path(phone: str) -> str:
+    return os.path.join(USERS_DIR, f"{phone}.json")
 
-def ensure_runner():
-    """
-    Start runner.py if not already running (uses runner.pid written by runner).
-    """
-    if RUNNER_PID.exists():
+def session_path(phone: str) -> str:
+    return os.path.join(SESS_DIR, f"{phone}.session")
+
+def start_runner(cfg_path: str):
+    """Detach a runner for the given user config."""
+    print(f"▶ Starting runner for {cfg_path}")
+    subprocess.Popen(
+        [sys.executable, "runner.py", cfg_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+    )
+
+def login_flow():
+    phone = input("Enter phone (+countrycode): ").strip()
+    api_id = int(input("Enter API_ID: ").strip())
+    api_hash = input("Enter API_HASH: ").strip()
+
+    sess_name = os.path.join(SESS_DIR, phone)
+    client = TelegramClient(sess_name, api_id, api_hash)
+
+    print("Connecting…")
+    client.connect()
+    if not client.is_user_authorized():
+        client.send_code_request(phone)
+        code = input("Enter the code you received: ").strip()
         try:
-            pid = int(RUNNER_PID.read_text().strip())
-            if _alive_pid(pid):
-                print(f"[runner] already running (pid {pid})")
-                return
-        except Exception:
+            client.sign_in(phone, code)
+        except SessionPasswordNeededError:
+            pwd = input("Enter your 2FA password: ").strip()
+            client.sign_in(password=pwd)
+    client.disconnect()
+
+    cfg = {
+        **DEFAULT_CFG,
+        "phone": phone,
+        "api_id": api_id,
+        "api_hash": api_hash,
+    }
+    cfg_path = user_cfg_path(phone)
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"✔ Saved user config: {cfg_path}")
+
+    start_runner(cfg_path)
+
+def delete_user():
+    phone = input("Phone to delete (+countrycode): ").strip()
+    cfg = user_cfg_path(phone)
+    sess = session_path(phone)
+    sess_journal = sess + "-journal"
+
+    for p in [cfg, sess, sess_journal]:
+        try:
+            os.remove(p)
+            print(f"🗑️ Deleted {p}")
+        except FileNotFoundError:
             pass
-    print("[runner] starting…")
-    # detach runner; silence output
-    subprocess.Popen([sys.executable, "runner.py"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
-# ==== config & login ====
-def write_config(phone: str, api_id: int, api_hash: str) -> Path:
-    cfg_path = CONFIG_DIR / f"{phone}.json"
-    cfg = TEMPLATE.copy()
-    if cfg_path.exists():
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            try:
-                cfg.update(json.load(f))
-            except Exception:
-                pass
-    cfg["phone"] = phone
-    cfg["api_id"] = api_id
-    cfg["api_hash"] = api_hash
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    return cfg_path
+def list_users():
+    print("Users:")
+    for f in os.listdir(USERS_DIR):
+        if not f.endswith(".json"):
+            continue
+        path = os.path.join(USERS_DIR, f)
+        try:
+            with open(path) as fp:
+                cfg = json.load(fp)
+            exp = cfg.get("expire_date", "—")
+            print(f" - {f[:-5]} | expire={exp}")
+        except Exception:
+            print(f" - {f[:-5]} (invalid json)")
 
-async def do_otp_login(phone: str, api_id: int, api_hash: str):
-    session_file = str(SESS_DIR / phone)
-    client = TelegramClient(session_file, api_id, api_hash)
-    await client.connect()
+def restart_runner():
+    phone = input("Phone to restart: ").strip()
+    cfg = user_cfg_path(phone)
+    if not os.path.exists(cfg):
+        print("No such user.")
+        return
+    start_runner(cfg)
 
-    # Handle both coroutine & sync is_user_authorized (telethon version differences)
+def set_or_show_expiry():
+    phone = input("Phone to set/show expiry: ").strip()
+    cfg_path = user_cfg_path(phone)
+    if not os.path.exists(cfg_path):
+        print("No such user.")
+        return
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    current = cfg.get("expire_date", "2026-01-10")
+    print(f"Current expire date: {current}")
+    newv = input("Enter new date YYYY-MM-DD (leave blank to keep): ").strip()
+    if not newv:
+        return
     try:
-        authorized = await client.is_user_authorized()
-    except TypeError:
-        authorized = client.is_user_authorized()
-
-    if authorized:
-        me = await client.get_me()
-        print(f"✔ already logged in as {getattr(me, 'first_name', '')} ({me.id})")
-        await client.disconnect()
+        datetime.strptime(newv, "%Y-%m-%d")
+    except ValueError:
+        print("Invalid date format. Use YYYY-MM-DD (e.g., 2026-01-10).")
         return
 
-    # Send OTP and sign in
-    await client.send_code_request(phone)
-    for _ in range(3):
-        code = input("Enter Telegram OTP: ").strip()
-        try:
-            await client.sign_in(phone=phone, code=code)
-            break
-        except PhoneCodeInvalidError:
-            print("✖ invalid code, try again.")
-        except SessionPasswordNeededError:
-            pw = getpass("Two-step password: ").strip()
-            await client.sign_in(password=pw)
-            break
+    cfg["expire_date"] = newv
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"✔ Updated expire date to {newv}")
 
-    try:
-        try:
-            authorized = await client.is_user_authorized()
-        except TypeError:
-            authorized = client.is_user_authorized()
-        if not authorized:
-            raise RuntimeError("login failed; not authorized")
-        me = await client.get_me()
-        print(f"✅ logged in as {getattr(me, 'first_name', '')} ({me.id}); session saved at {session_file}")
-    finally:
-        await client.disconnect()
-
-# ==== menu flows ====
-def flow_add_user():
-    phone = input("Phone (+countrycode): ").strip()
-    if not phone:
-        print("phone is required."); return
-    api_id_str = input("API_ID: ").strip()
-    if not api_id_str.isdigit():
-        print("API_ID must be a number."); return
-    api_id = int(api_id_str)
-    api_hash = getpass("API_HASH (hidden): ").strip()
-    if not api_hash:
-        print("API_HASH is required."); return
-
-    cfg_path = write_config(phone, api_id, api_hash)
-    print(f"• config written: {cfg_path}")
-
-    asyncio.run(do_otp_login(phone, api_id, api_hash))
-
-    # auto-start runner so you can test the new user immediately
-    ensure_runner()
-    print("Tip: in Telegram, send `.status` (from any chat) to verify settings.\n"
-          "      Add groups via `.addgroup @g1,@g2` in Saved or any chat (self).")
-
-def flow_delete_user():
-    # Show available users to help pick
-    files = sorted(CONFIG_DIR.glob("*.json"))
-    if files:
-        print("Existing users:")
-        for p in files:
-            print(" -", p.stem)
-    phone = input("Phone to delete (+countrycode): ").strip()
-    if not phone:
-        print("phone is required."); return
-    cfg_file = CONFIG_DIR / f"{phone}.json"
-    sess_file = SESS_DIR / phone
-    removed_any = False
-    if cfg_file.exists():
-        cfg_file.unlink()
-        print("• deleted config:", cfg_file.name)
-        removed_any = True
-    if sess_file.exists():
-        # Telethon session is usually a .session file; our name has no ext, so both may exist
-        try:
-            sess_file.unlink()
-            print("• deleted session:", sess_file.name)
-            removed_any = True
-        except Exception:
-            pass
-        # Also try session with .session suffix
-        ss = Path(str(sess_file) + ".session")
-        if ss.exists():
-            ss.unlink()
-            print("• deleted session:", ss.name)
-            removed_any = True
-    if not removed_any:
-        print("nothing to delete for that phone")
-
-# ==== UI ====
 def main():
-    ensure_runner()  # keep runner alive in background
     while True:
-        print("\n==== Forwarder Login ====")
-        print("  1) Add user (OTP login)")
-        print("  2) Delete user")
-        print("  3) Exit")
-        choice = input("➤ Choose: ").strip()
+        print(MENU)
+        choice = input("➻ Choose option: ").strip()
         if choice == "1":
-            flow_add_user()
+            login_flow()
         elif choice == "2":
-            flow_delete_user()
+            delete_user()
         elif choice == "3":
-            sys.exit(0)
+            list_users()
+        elif choice == "4":
+            restart_runner()
+        elif choice == "5":
+            set_or_show_expiry()
+        elif choice == "6":
+            print("Bye.")
+            break
         else:
-            print("invalid choice.")
+            print("Invalid choice.")
 
 if __name__ == "__main__":
     main()
+    
