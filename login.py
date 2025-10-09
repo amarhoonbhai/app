@@ -6,7 +6,12 @@ import asyncio
 from datetime import datetime
 
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeFloodError,
+    PhoneNumberInvalidError,
+    PhoneNumberBannedError,
+)
 
 USERS_DIR = "users"
 SESS_DIR = "sessions"
@@ -16,7 +21,7 @@ os.makedirs(SESS_DIR, exist_ok=True)
 MENU = """
 ==== Telegram Forwarder CLI ====
   [1] Login with QR (no phone input)
-  [2] Login with phone (OTP / 2FA)
+  [2] Login with phone (OTP to Telegram app)
   [3] Delete user
   [4] List users
   [5] Restart runner
@@ -38,10 +43,10 @@ def user_cfg_path(label: str) -> str:
     return os.path.join(USERS_DIR, f"{label}.json")
 
 def session_path(label: str) -> str:
-    return os.path.join(SESS_DIR, f"{label}")
+    # Telethon will create sessions/<label>.session
+    return os.path.join(SESS_DIR, label)
 
 def start_runner(cfg_path: str):
-    """Detach a runner for the given user config."""
     print(f"▶ Starting runner for {cfg_path}")
     subprocess.Popen(
         [sys.executable, "runner.py", cfg_path],
@@ -55,73 +60,75 @@ def get_api_creds():
     api_hash = os.getenv("API_HASH") or input("Enter API_HASH: ").strip()
     return int(api_id), api_hash
 
-# ---------------- QR LOGIN (no phone input) ----------------
+# ---------------- ASYNC FLOWS ----------------
 async def do_qr_login(label: str, api_id: int, api_hash: str):
-    sess_name = session_path(label)
-    client = TelegramClient(sess_name, api_id, api_hash)
-    await client.connect()
-    print("\nGenerating QR login link...")
-    qr = await client.qr_login()  # shows a tg://login?token=... URL internally
-    print("\nOpen this ON YOUR PHONE (or any logged-in Telegram app) to approve login:\n")
-    print(qr.url)  # Opening this tg:// URL in Telegram approves the session. 2FA handled below.
-    try:
-        await qr.wait()  # wait until the login is accepted on your device
-    except SessionPasswordNeededError:
-        pwd = input("Enter your 2FA password: ").strip()
-        await client.check_password(pwd)
+    async with TelegramClient(session_path(label), api_id, api_hash) as client:
+        print("\nGenerating QR login link…")
+        token = await client.qr_login()
+        print("\nOpen this ON YOUR PHONE (any logged-in Telegram app) to approve:\n")
+        print(token.url)
+        try:
+            await token.wait()  # approve in Telegram
+        except SessionPasswordNeededError:
+            pwd = input("Enter your 2FA password: ").strip()
+            await client.check_password(pwd)
+        me = await client.get_me()
+        print(f"✔ Authorized as @{getattr(me, 'username', None) or me.first_name}")
 
-    me = await client.get_me()
-    print(f"✔ Authorized as @{getattr(me, 'username', None) or me.first_name}")
-    await client.disconnect()
+async def do_phone_login(label: str, api_id: int, api_hash: str, phone: str):
+    async with TelegramClient(session_path(label), api_id, api_hash) as client:
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            print(f"✔ Already authorized as @{getattr(me, 'username', None) or me.first_name}")
+            return
 
+        try:
+            print("Sending code to your Telegram app (check the 'Telegram' service chat)…")
+            # force_sms=False ensures delivery to Telegram app first (not SMS)
+            await client.send_code_request(phone, force_sms=False)
+        except PhoneNumberInvalidError:
+            print("✖ Phone number looks invalid. Use +countrycode, e.g. +447…")
+            return
+        except PhoneNumberBannedError:
+            print("✖ This phone number is banned by Telegram.")
+            return
+        except PhoneCodeFloodError as e:
+            secs = getattr(e, "seconds", None)
+            print(f"⏳ Flood-wait. Try again later{f' (~{secs}s)' if secs else ''}.")
+            return
+
+        code = input("Enter the code you received in the Telegram app: ").strip()
+        try:
+            await client.sign_in(phone=phone, code=code)
+        except SessionPasswordNeededError:
+            pwd = input("2FA is enabled. Enter your password: ").strip()
+            await client.sign_in(password=pwd)
+
+        me = await client.get_me()
+        print(f"✔ Authorized as @{getattr(me, 'username', None) or me.first_name}")
+
+# ---------------- SYNC WRAPPERS ----------------
 def login_with_qr():
-    print("== QR Login ==")
     label = input("Choose a session label (e.g. main, work): ").strip()
     api_id, api_hash = get_api_creds()
     asyncio.run(do_qr_login(label, api_id, api_hash))
 
-    cfg = {
-        **DEFAULT_CFG,
-        # NOTE: runner.py uses CFG['phone'] only to form the session filename.
-        # We store the chosen label here; it doesn't need to be an actual phone number.
-        "phone": label,
-        "api_id": api_id,
-        "api_hash": api_hash,
-    }
+    cfg = {**DEFAULT_CFG, "phone": label, "api_id": api_id, "api_hash": api_hash}
     cfg_path = user_cfg_path(label)
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
     print(f"✔ Saved user config: {cfg_path}")
     start_runner(cfg_path)
 
-# ---------------- PHONE LOGIN (fallback) ----------------
 def login_with_phone():
-    print("== Phone Login ==")
     phone = input("Enter phone (+countrycode): ").strip()
     api_id, api_hash = get_api_creds()
+    label = phone  # use phone as session label
 
-    sess_name = session_path(phone)
-    client = TelegramClient(sess_name, api_id, api_hash)
+    asyncio.run(do_phone_login(label, api_id, api_hash, phone))
 
-    print("Connecting…")
-    client.connect()
-    if not client.is_user_authorized():
-        client.send_code_request(phone)
-        code = input("Enter the code you received: ").strip()
-        try:
-            client.sign_in(phone, code)
-        except SessionPasswordNeededError:
-            pwd = input("Enter your 2FA password: ").strip()
-            client.sign_in(password=pwd)
-    client.disconnect()
-
-    cfg = {
-        **DEFAULT_CFG,
-        "phone": phone,
-        "api_id": api_id,
-        "api_hash": api_hash,
-    }
-    cfg_path = user_cfg_path(phone)
+    cfg = {**DEFAULT_CFG, "phone": label, "api_id": api_id, "api_hash": api_hash}
+    cfg_path = user_cfg_path(label)
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
     print(f"✔ Saved user config: {cfg_path}")
