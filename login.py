@@ -6,12 +6,22 @@ import asyncio
 from datetime import datetime
 
 from telethon import TelegramClient
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeFloodError,
-    PhoneNumberInvalidError,
-    PhoneNumberBannedError,
-)
+from telethon.errors import RPCError, SessionPasswordNeededError
+# IMPORTANT: RPC error classes live in rpcerrorlist
+try:
+    from telethon.errors.rpcerrorlist import (
+        PhoneCodeFloodError,
+        PhoneNumberInvalidError,
+        PhoneNumberBannedError,
+        FloodWaitError,
+    )
+except Exception:
+    # Fallback aliases so code runs even if names differ; we'll still catch RPCError below.
+    class _Alias(RPCError): ...
+    PhoneCodeFloodError = _Alias
+    PhoneNumberInvalidError = _Alias
+    PhoneNumberBannedError = _Alias
+    FloodWaitError = _Alias
 
 USERS_DIR = "users"
 SESS_DIR = "sessions"
@@ -82,9 +92,9 @@ async def do_phone_login(label: str, api_id: int, api_hash: str, phone: str):
             print(f"✔ Already authorized as @{getattr(me, 'username', None) or me.first_name}")
             return
 
+        # Request code to Telegram app (service chat "Telegram")
         try:
             print("Sending code to your Telegram app (check the 'Telegram' service chat)…")
-            # force_sms=False ensures delivery to Telegram app first (not SMS)
             await client.send_code_request(phone, force_sms=False)
         except PhoneNumberInvalidError:
             print("✖ Phone number looks invalid. Use +countrycode, e.g. +447…")
@@ -92,9 +102,12 @@ async def do_phone_login(label: str, api_id: int, api_hash: str, phone: str):
         except PhoneNumberBannedError:
             print("✖ This phone number is banned by Telegram.")
             return
-        except PhoneCodeFloodError as e:
+        except (PhoneCodeFloodError, FloodWaitError) as e:
             secs = getattr(e, "seconds", None)
             print(f"⏳ Flood-wait. Try again later{f' (~{secs}s)' if secs else ''}.")
+            return
+        except RPCError as e:
+            print(f"⚠️ Code request failed: {e}.")
             return
 
         code = input("Enter the code you received in the Telegram app: ").strip()
@@ -216,3 +229,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
