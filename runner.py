@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import asyncio
 import logging
 import re
@@ -11,46 +12,98 @@ try:
 except Exception:
     ZoneInfo = None
 
-from dotenv import load_dotenv
-from pymongo import MongoClient
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import RPCError
 
-# =========================
-# Env / DB bootstrap
-# =========================
-load_dotenv()
+BASE_DIR = os.path.dirname(__file__)
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+USERS_DIR = os.path.join(BASE_DIR, "users")
+CODES_PATH = os.path.join(BASE_DIR, "plan_codes.json")
 
-API_ID = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or 0)
-API_HASH = os.getenv("TG_API_HASH") or os.getenv("API_HASH") or ""
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-DB_NAME = os.getenv("SPINIFY_DB_NAME", "spinify")
-
-if not API_ID or not API_HASH:
-    raise SystemExit("[!] Set TG_API_ID/API_ID and TG_API_HASH/API_HASH in .env")
-
-mongo = MongoClient(MONGO_URI)
-db = mongo[DB_NAME]
-users_col = db.users
-codes_col = db.plan_codes
-
-# =========================
-# General config
-# =========================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+DEFAULT_TZ = "Asia/Kolkata"
 DEFAULT_AUTONIGHT = {
     "enabled": True,
     "start": "23:00",        # HH:MM 24h
     "end": "07:00",
-    "tz": "Asia/Kolkata",
+    "tz": DEFAULT_TZ,
 }
 DEFAULT_DELAY_SEC = 5
 DEFAULT_CYCLE_MIN = 15
 
-started_users = set()  # track started Mongo _id (string)
+started_users: set[str] = set()  # track started user files (paths)
+
+
+# =========================
+# Config & storage helpers
+# =========================
+def load_config() -> dict:
+    if not os.path.exists(CONFIG_PATH):
+        raise SystemExit("[!] config.json not found. Run login.py first to set API_ID/API_HASH.")
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        raise SystemExit(f"[!] Failed to read config.json: {e}")
+    if "API_ID" not in cfg or "API_HASH" not in cfg:
+        raise SystemExit("[!] config.json missing API_ID or API_HASH. Run login.py again.")
+    return cfg
+
+
+CFG = load_config()
+API_ID = int(CFG["API_ID"])
+API_HASH = str(CFG["API_HASH"])
+
+os.makedirs(USERS_DIR, exist_ok=True)
+
+
+def load_user_from_file(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load user file {path}: {e}")
+        return None
+
+
+def save_user_to_file(user: dict) -> None:
+    phone = user.get("phone")
+    if not phone:
+        return
+    safe = phone.replace(" ", "")
+    path = os.path.join(USERS_DIR, f"{safe}.json")
+    user["updated_at"] = datetime.utcnow().isoformat()
+    if "created_at" not in user:
+        user["created_at"] = user["updated_at"]
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(user, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save user {phone}: {e}")
+
+
+def load_codes() -> list[dict]:
+    if not os.path.exists(CODES_PATH):
+        return []
+    try:
+        with open(CODES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        logger.error(f"Failed to load plan codes: {e}")
+    return []
+
+
+def save_codes(codes: list[dict]) -> None:
+    try:
+        with open(CODES_PATH, "w", encoding="utf-8") as f:
+            json.dump(codes, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save plan codes: {e}")
 
 
 # =========================
@@ -189,85 +242,76 @@ def autonight_parse_command(arg: str, cfg: dict) -> Tuple[str, dict]:
     )
 
 
-def load_autonight_for_user(user_doc: dict) -> dict:
+def load_autonight_for_user(user_cfg: dict) -> dict:
     cfg = DEFAULT_AUTONIGHT.copy()
-    db_cfg = user_doc.get("auto_night") or {}
+    db_cfg = user_cfg.get("auto_night") or {}
     for k in cfg:
         if k in db_cfg:
             cfg[k] = db_cfg[k]
     return cfg
 
 
-def save_autonight_for_user(user_id, cfg: dict) -> None:
-    users_col.update_one(
-        {"_id": user_id},
-        {"$set": {"auto_night": cfg, "updated_at": datetime.utcnow()}}
-    )
+def save_autonight_for_user(user_cfg: dict, new_cfg: dict) -> None:
+    user_cfg["auto_night"] = new_cfg
+    save_user_to_file(user_cfg)
 
 
 # =========================
 # Plan helpers
 # =========================
-def is_plan_active(user_doc: dict) -> bool:
+def parse_expiry(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+    return None
+
+
+def is_plan_active(user_cfg: dict) -> bool:
     """
     True if plan is active (no expiry or expiry in the future).
     """
-    exp = user_doc.get("plan_expiry")
+    exp = parse_expiry(user_cfg.get("plan_expiry"))
     if not exp:
         return True
-
-    if isinstance(exp, str):
-        try:
-            exp = datetime.fromisoformat(exp)
-        except ValueError:
-            # broken expiry: treat as expired (safer)
-            return False
-
     now = datetime.utcnow()
-    if exp.tzinfo is not None:
-        now = now.astimezone(exp.tzinfo)
     return now < exp
 
 
-def plan_text(user_doc: dict) -> str:
-    exp = user_doc.get("plan_expiry")
-    name = user_doc.get("plan_name") or "free"
+def plan_text(user_cfg: dict) -> str:
+    name = user_cfg.get("plan_name") or "free"
+    exp = parse_expiry(user_cfg.get("plan_expiry"))
     if not exp:
         return f"{name} (∞)"
-    if isinstance(exp, str):
-        try:
-            exp_dt = datetime.fromisoformat(exp)
-        except ValueError:
-            return f"{name} (invalid expiry)"
-    else:
-        exp_dt = exp
-    return f"{name} (till {exp_dt.strftime('%Y-%m-%d')})"
+    return f"{name} (till {exp.strftime('%Y-%m-%d')})"
 
 
 # =========================
 # Core per-user bot
 # =========================
-async def run_user_bot(user_doc: dict):
-    user_id = user_doc["_id"]
-    uid_str = str(user_id)
-    phone = user_doc.get("phone") or "unknown"
-    name = user_doc.get("name") or phone
-
-    if uid_str in started_users:
+async def run_user_bot(config_path: str, user_cfg: dict):
+    # Avoid duplicate start
+    if config_path in started_users:
         return
 
-    session_str = user_doc.get("string_session")
+    phone = user_cfg.get("phone") or "unknown"
+    name = user_cfg.get("name") or phone
+    session_str = user_cfg.get("string_session")
     if not session_str:
-        logger.error(f"[{phone}] No string_session in DB, skipping.")
+        logger.error(f"[{phone}] No string_session in user config, skipping.")
         return
 
     # Per-user settings
-    settings = user_doc.get("settings") or {}
+    settings = user_cfg.get("settings") or {}
     delay_sec = int(settings.get("msg_delay_sec", DEFAULT_DELAY_SEC))
     cycle_min = int(settings.get("cycle_delay_min", DEFAULT_CYCLE_MIN))
 
-    auto_cfg = load_autonight_for_user(user_doc)
-
+    auto_cfg = load_autonight_for_user(user_cfg)
     user_state = {
         "delay": delay_sec,   # seconds between forwards
         "cycle": cycle_min,   # minutes between cycles
@@ -288,7 +332,7 @@ async def run_user_bot(user_doc: dict):
         logger.exception(f"[{phone}] Failed to start client: {e}")
         return
 
-    started_users.add(uid_str)
+    started_users.add(config_path)
     me = await client.get_me()
     owner_id = me.id
 
@@ -305,12 +349,11 @@ async def run_user_bot(user_doc: dict):
         if not text.startswith("."):
             return
 
-        # Reload latest user_doc from DB for up-to-date plan/groups/autonight/etc.
-        current_doc = users_col.find_one({"_id": user_id}) or user_doc
-        auto_cfg_local = load_autonight_for_user(current_doc)
+        # Reload latest user_cfg from disk for up-to-date data
+        current = load_user_from_file(config_path) or user_cfg
+        auto_cfg_local = load_autonight_for_user(current)
         user_state["auto_cfg"] = auto_cfg_local
-
-        groups = current_doc.get("groups") or []
+        groups = current.get("groups") or []
 
         # ---------- timing ----------
         if text.startswith(".time"):
@@ -322,15 +365,12 @@ async def run_user_bot(user_doc: dict):
                 user_state["cycle"] = value * 60  # hours → minutes
             else:
                 user_state["cycle"] = value       # minutes
-            users_col.update_one(
-                {"_id": user_id},
-                {
-                    "$set": {
-                        "settings.cycle_delay_min": user_state["cycle"],
-                        "updated_at": datetime.utcnow(),
-                    }
-                },
-            )
+
+            settings = current.get("settings") or {}
+            settings["cycle_delay_min"] = user_state["cycle"]
+            current["settings"] = settings
+            save_user_to_file(current)
+
             await event.respond(f"✅ Cycle delay set to **{user_state['cycle']} minutes**")
 
         elif text.startswith(".delay"):
@@ -339,39 +379,36 @@ async def run_user_bot(user_doc: dict):
                 await event.respond("❗ Usage: `.delay 5` (seconds)")
                 return
             user_state["delay"] = value
-            users_col.update_one(
-                {"_id": user_id},
-                {
-                    "$set": {
-                        "settings.msg_delay_sec": user_state["delay"],
-                        "updated_at": datetime.utcnow(),
-                    }
-                },
-            )
+
+            settings = current.get("settings") or {}
+            settings["msg_delay_sec"] = user_state["delay"]
+            current["settings"] = settings
+            save_user_to_file(current)
+
             await event.respond(f"✅ Message delay set to **{value} seconds**")
 
         # ---------- basic info ----------
         elif text.startswith(".status"):
-            current_doc = users_col.find_one({"_id": user_id}) or current_doc
-            auto_cfg_local = load_autonight_for_user(current_doc)
+            current = load_user_from_file(config_path) or current
+            auto_cfg_local = load_autonight_for_user(current)
             user_state["auto_cfg"] = auto_cfg_local
             await event.respond(
                 "📊 Status:\n"
                 f"• Cycle Delay: **{user_state['cycle']} minutes**\n"
                 f"• Message Delay: **{user_state['delay']} seconds**\n"
-                f"• Plan: **{plan_text(current_doc)}**\n\n"
+                f"• Plan: **{plan_text(current)}**\n\n"
                 + autonight_status_text(auto_cfg_local)
             )
 
         elif text.startswith(".info"):
-            current_doc = users_col.find_one({"_id": user_id}) or current_doc
-            auto_cfg_local = load_autonight_for_user(current_doc)
+            current = load_user_from_file(config_path) or current
+            auto_cfg_local = load_autonight_for_user(current)
             user_state["auto_cfg"] = auto_cfg_local
-            expiry_str = "Developer" if me.id == 7876302875 else plan_text(current_doc)
+            expiry_str = "Developer" if me.id == 7876302875 else plan_text(current)
             reply = (
                 f"❀ User Info:\n"
-                f"❀ Name: {current_doc.get('name')}\n"
-                f"❀ Phone: {current_doc.get('phone')}\n"
+                f"❀ Name: {current.get('name')}\n"
+                f"❀ Phone: {current.get('phone')}\n"
                 f"❀ Cycle Delay: {user_state['cycle']} min\n"
                 f"❀ Message Delay: {user_state['delay']} sec\n"
                 f"❀ Groups: {len(groups)}\n"
@@ -395,12 +432,8 @@ async def run_user_bot(user_doc: dict):
                 else:
                     skipped.append(link)
 
-            users_col.update_one(
-                {"_id": user_id},
-                {
-                    "$set": {"groups": groups, "updated_at": datetime.utcnow()},
-                },
-            )
+            current["groups"] = groups
+            save_user_to_file(current)
 
             msg = []
             if added:
@@ -413,12 +446,8 @@ async def run_user_bot(user_doc: dict):
             parts = text.split()
             if len(parts) == 2 and parts[1] in groups:
                 groups.remove(parts[1])
-                users_col.update_one(
-                    {"_id": user_id},
-                    {
-                        "$set": {"groups": groups, "updated_at": datetime.utcnow()},
-                    },
-                )
+                current["groups"] = groups
+                save_user_to_file(current)
                 await event.respond("❀ Group removed.")
             else:
                 await event.respond("❗ Usage: `.delgroup <https://t.me/...>` (must match an existing group)")
@@ -433,11 +462,11 @@ async def run_user_bot(user_doc: dict):
         elif text.startswith(".night"):
             arg = text[6:].strip() if len(text) > 6 else ""
             msg, new_cfg = autonight_parse_command(arg, auto_cfg_local)
-            save_autonight_for_user(user_id, new_cfg)
+            save_autonight_for_user(current, new_cfg)
             user_state["auto_cfg"] = new_cfg
             await event.respond(msg)
 
-        # ---------- Plan code redeem ----------
+        # ---------- Plan code redeem (from Telegram) ----------
         elif text.startswith(".redeem"):
             parts = text.split(maxsplit=1)
             if len(parts) != 2:
@@ -448,7 +477,15 @@ async def run_user_bot(user_doc: dict):
                 await event.respond("❗ Usage: `.redeem ABCD1234`")
                 return
 
-            code_doc = codes_col.find_one({"code": code_str})
+            codes = load_codes()
+            idx = None
+            code_doc = None
+            for i, c in enumerate(codes):
+                if c.get("code") == code_str:
+                    idx = i
+                    code_doc = c
+                    break
+
             if not code_doc:
                 await event.respond("❌ Invalid code.")
                 return
@@ -456,41 +493,29 @@ async def run_user_bot(user_doc: dict):
                 await event.respond("⚠️ This code has already been used.")
                 return
 
-            plan_expiry = code_doc.get("plan_expiry")
+            plan_expiry_raw = code_doc.get("plan_expiry")
             plan_name = code_doc.get("plan_name", "custom")
 
-            if not isinstance(plan_expiry, datetime):
-                await event.respond("❌ Code misconfigured (no expiry in DB). Contact support.")
+            exp_dt = parse_expiry(plan_expiry_raw)
+            if not exp_dt:
+                await event.respond("❌ Code misconfigured (no valid expiry). Contact support.")
                 return
 
             # Update user
-            users_col.update_one(
-                {"_id": user_id},
-                {
-                    "$set": {
-                        "plan_name": plan_name,
-                        "plan_expiry": plan_expiry,
-                        "updated_at": datetime.utcnow(),
-                    }
-                },
-            )
+            current["plan_name"] = plan_name
+            current["plan_expiry"] = exp_dt.isoformat()
+            save_user_to_file(current)
 
             # Mark code used
-            codes_col.update_one(
-                {"_id": code_doc["_id"]},
-                {
-                    "$set": {
-                        "used": True,
-                        "used_by": user_id,
-                        "used_at": datetime.utcnow(),
-                    }
-                },
-            )
+            codes[idx]["used"] = True
+            codes[idx]["used_by"] = current.get("phone")
+            codes[idx]["used_at"] = datetime.utcnow().isoformat()
+            save_codes(codes)
 
             await event.respond(
                 f"✅ Code applied.\n"
                 f"Plan: **{plan_name}**\n"
-                f"Valid till: **{plan_expiry.strftime('%Y-%m-%d')}**"
+                f"Valid till: **{exp_dt.strftime('%Y-%m-%d')}**"
             )
 
         # ---------- help ----------
@@ -514,28 +539,29 @@ async def run_user_bot(user_doc: dict):
     async def forward_loop():
         while True:
             try:
-                doc = users_col.find_one({"_id": user_id})
-                if not doc:
-                    logger.info(f"[{phone}] User removed from DB. Stopping loop.")
+                # reload config from disk
+                cfg = load_user_from_file(config_path)
+                if not cfg:
+                    logger.info(f"[{phone}] User file deleted. Stopping loop.")
                     return
 
-                if not doc.get("active", True):
+                if not cfg.get("active", True):
                     logger.info(f"[{phone}] User inactive. Sleeping 5 minutes.")
                     await asyncio.sleep(300)
                     continue
 
-                if not is_plan_active(doc):
+                if not is_plan_active(cfg):
                     logger.info(f"[{phone}] Plan expired. Sleeping 5 minutes.")
                     await asyncio.sleep(300)
                     continue
 
-                groups = doc.get("groups") or []
+                groups = cfg.get("groups") or []
                 if not groups:
                     logger.info(f"[{phone}] No groups configured. Sleeping 5 minutes.")
                     await asyncio.sleep(300)
                     continue
 
-                auto_cfg_local = load_autonight_for_user(doc)
+                auto_cfg_local = load_autonight_for_user(cfg)
                 user_state["auto_cfg"] = auto_cfg_local
 
                 # 🌙 Auto-Night window
@@ -595,19 +621,27 @@ async def run_user_bot(user_doc: dict):
 async def user_loader():
     while True:
         try:
-            for user_doc in users_col.find({"active": {"$ne": False}}):
-                user_id = user_doc["_id"]
-                uid_str = str(user_id)
-                phone = user_doc.get("phone")
-
-                if uid_str in started_users:
+            for name in os.listdir(USERS_DIR):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(USERS_DIR, name)
+                if path in started_users:
                     continue
 
-                if not is_plan_active(user_doc):
+                cfg = load_user_from_file(path)
+                if not cfg:
+                    continue
+
+                phone = cfg.get("phone")
+                if not is_plan_active(cfg):
                     logger.info(f"[⏳] Plan expired for {phone}. Not starting client.")
                     continue
 
-                asyncio.create_task(run_user_bot(user_doc))
+                if cfg.get("active", True) is False:
+                    logger.info(f"[{phone}] User marked inactive. Skipping start.")
+                    continue
+
+                asyncio.create_task(run_user_bot(path, cfg))
         except Exception as e:
             logger.exception(f"Error in user_loader: {e}")
         await asyncio.sleep(60)
