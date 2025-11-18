@@ -32,6 +32,7 @@ db = mongo[DB_NAME]
 users = db.users          # users collection
 codes = db.plan_codes     # subscription codes collection
 
+DEFAULT_TZ = "Asia/Kolkata"
 
 # --------------------
 # Helpers
@@ -52,7 +53,6 @@ def parse_date(prompt: str) -> datetime:
         val = input(prompt).strip()
         try:
             d = datetime.strptime(val, "%Y-%m-%d")
-            # expiry at the end of that day
             return d + timedelta(days=1) - timedelta(seconds=1)
         except ValueError:
             print("Invalid date. Format must be YYYY-MM-DD (example: 2025-12-31).")
@@ -91,7 +91,8 @@ def choose_user() -> dict | None:
         name = u.get("name") or ""
         plan_expiry = u.get("plan_expiry")
         plan_str = plan_expiry.strftime("%Y-%m-%d") if plan_expiry else "∞"
-        print(f"{idx}) {phone} | {name} | plan till: {plan_str}")
+        active = "YES" if u.get("active", True) else "NO"
+        print(f"{idx}) {phone} | {name} | plan till: {plan_str} | active: {active}")
 
     while True:
         sel = input("Select user # (or blank to cancel): ").strip()
@@ -123,14 +124,14 @@ def list_users():
         plan_name = u.get("plan_name") or "NA"
         auto = u.get("auto_night") or {}
         auto_enabled = auto.get("enabled", False)
-        sh = auto.get("start_hour", 23)
-        eh = auto.get("end_hour", 7)
+        start = auto.get("start", "23:00")
+        end = auto.get("end", "07:00")
         active = u.get("active", True)
 
         plan_str = plan_expiry.strftime("%Y-%m-%d") if plan_expiry else "∞"
         print(
             f"- {phone} | {name} | plan: {plan_name} till {plan_str} | "
-            f"auto-night: {'ON' if auto_enabled else 'OFF'} ({sh}:00→{eh}:00) | "
+            f"auto-night: {'ON' if auto_enabled else 'OFF'} ({start}→{end}) | "
             f"active: {'YES' if active else 'NO'}"
         )
 
@@ -166,7 +167,7 @@ def login_new_user():
 
     print("Login successful.")
 
-    # Initial plan (can be extended later with codes)
+    # Initial plan
     use_plan = input("Set an initial plan expiry now? (y/N): ").strip().lower()
     plan_expiry = None
     plan_name = "free"
@@ -174,13 +175,24 @@ def login_new_user():
         plan_expiry = parse_date("Plan expiry date (YYYY-MM-DD): ")
         plan_name = input("Plan label (e.g. PRO30): ").strip() or "custom"
 
-    # Per-user auto-night
+    # Per-user auto-night (structure compatible with runner.py)
     enable_an = input("Enable Auto-Night for this user? (y/N): ").strip().lower()
-    auto_cfg = {"enabled": False, "start_hour": 23, "end_hour": 7}
     if enable_an == "y":
         sh = parse_hour("Start hour (0–23)", 23)
         eh = parse_hour("End hour (0–23)", 7)
-        auto_cfg = {"enabled": True, "start_hour": sh, "end_hour": eh}
+        auto_cfg = {
+            "enabled": True,
+            "start": f"{sh:02d}:00",
+            "end": f"{eh:02d}:00",
+            "tz": DEFAULT_TZ,
+        }
+    else:
+        auto_cfg = {
+            "enabled": False,
+            "start": "23:00",
+            "end": "07:00",
+            "tz": DEFAULT_TZ,
+        }
 
     now = datetime.utcnow()
     users.insert_one(
@@ -191,6 +203,11 @@ def login_new_user():
             "plan_name": plan_name,
             "plan_expiry": plan_expiry,  # None = unlimited
             "auto_night": auto_cfg,
+            "groups": [],  # will be updated via .addgroup inside runner.py
+            "settings": {
+                "msg_delay_sec": 5,
+                "cycle_delay_min": 15,
+            },
             "active": True,
             "created_at": now,
             "updated_at": now,
@@ -224,11 +241,12 @@ def show_auto_night():
         name = u.get("name") or ""
         auto = u.get("auto_night") or {}
         enabled = auto.get("enabled", False)
-        sh = auto.get("start_hour", 23)
-        eh = auto.get("end_hour", 7)
+        start = auto.get("start", "23:00")
+        end = auto.get("end", "07:00")
+        tz = auto.get("tz", DEFAULT_TZ)
         print(
             f"- {phone} | {name} -> "
-            f"{'ON' if enabled else 'OFF'} ({sh}:00→{eh}:00)"
+            f"{'ON' if enabled else 'OFF'} ({start}→{end}) [{tz}]"
         )
 
 
@@ -238,21 +256,49 @@ def edit_auto_night():
         return
 
     phone = user.get("phone")
-    auto = user.get("auto_night") or {"enabled": False, "start_hour": 23, "end_hour": 7}
+    auto = user.get("auto_night") or {
+        "enabled": False,
+        "start": "23:00",
+        "end": "07:00",
+        "tz": DEFAULT_TZ,
+    }
+
+    start_str = auto.get("start", "23:00")
+    end_str = auto.get("end", "07:00")
+    tz = auto.get("tz", DEFAULT_TZ)
+
+    def _hour_from_str(s: str, default: int) -> int:
+        try:
+            return int((s or "").split(":")[0])
+        except Exception:
+            return default
+
+    start_h_current = _hour_from_str(start_str, 23)
+    end_h_current = _hour_from_str(end_str, 7)
 
     print(f"\nCurrent Auto-Night for {phone}:")
     print(
         f"  enabled: {auto.get('enabled', False)}, "
-        f"{auto.get('start_hour', 23)}:00→{auto.get('end_hour', 7)}:00"
+        f"{start_str}→{end_str} [{tz}]"
     )
 
     en = input("Enable Auto-Night for this user? (y/N): ").strip().lower()
     if en == "y":
-        sh = parse_hour("Start hour (0–23)", auto.get("start_hour", 23))
-        eh = parse_hour("End hour (0–23)", auto.get("end_hour", 7))
-        new_auto = {"enabled": True, "start_hour": sh, "end_hour": eh}
+        sh = parse_hour("Start hour (0–23)", start_h_current)
+        eh = parse_hour("End hour (0–23)", end_h_current)
+        new_auto = {
+            "enabled": True,
+            "start": f"{sh:02d}:00",
+            "end": f"{eh:02d}:00",
+            "tz": tz,
+        }
     else:
-        new_auto = {"enabled": False, "start_hour": auto.get("start_hour", 23), "end_hour": auto.get("end_hour", 7)}
+        new_auto = {
+            "enabled": False,
+            "start": start_str,
+            "end": end_str,
+            "tz": tz,
+        }
 
     users.update_one(
         {"_id": user["_id"]},
@@ -272,7 +318,7 @@ def generate_plan_code():
         {
             "code": code,
             "plan_name": plan_name,
-            "plan_expiry": expiry_dt,
+            "plan_expiry": expiry_dt,  # datetime (runner expects datetime)
             "used": False,
             "used_by": None,
             "used_at": None,
@@ -359,7 +405,7 @@ def start_runner():
 # Menu
 # --------------------
 MENU = """
---- Telethon Multi-User Manager ---
+--- Telethon Multi-User Manager (CLI) ---
 1. List users
 2. Login new user
 3. Delete user
