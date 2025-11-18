@@ -1,38 +1,92 @@
 #!/usr/bin/env python3
 import os
 import sys
+import json
 import random
 import string
 from datetime import datetime, timedelta
 from getpass import getpass
 import subprocess
 
-from dotenv import load_dotenv
 from pymongo import MongoClient
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-# --------------------
-# Env / DB bootstrap
-# --------------------
-load_dotenv()
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+DEFAULT_TZ = "Asia/Kolkata"
 
-API_ID = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or 0)
-API_HASH = os.getenv("TG_API_HASH") or os.getenv("API_HASH") or ""
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-DB_NAME = os.getenv("SPINIFY_DB_NAME", "spinify")
+# --------------------
+# Config handling (no .env)
+# --------------------
+def load_or_init_config() -> dict:
+    cfg: dict = {}
 
-if not API_ID or not API_HASH:
-    print("[!] Set TG_API_ID/API_ID and TG_API_HASH/API_HASH in .env")
-    sys.exit(1)
+    # Try to load existing config.json
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+
+    def ask(key: str, label: str, cast=str, default=None):
+        # If already in config and looks valid, keep it
+        if key in cfg and cfg[key]:
+            return
+
+        while True:
+            prompt = label
+            if default is not None:
+                prompt += f" [{default}]"
+            prompt += ": "
+
+            val = input(prompt).strip()
+            if not val and default is not None:
+                val = default
+
+            if cast is int:
+                try:
+                    val = int(val)
+                except ValueError:
+                    print("Please enter a valid integer.")
+                    continue
+            if not val:
+                print("This value cannot be empty.")
+                continue
+            cfg[key] = val
+            break
+
+    print("=== Spinify CLI Setup (first run) ===" if not cfg else "=== Loaded config.json ===")
+
+    ask("API_ID", "Telegram API ID", cast=int)
+    ask("API_HASH", "Telegram API Hash", cast=str)
+    ask("MONGO_URI", "Mongo URI", cast=str, default="mongodb://localhost:27017/")
+    ask("DB_NAME", "Mongo DB Name", cast=str, default="spinify")
+
+    # Save back to file
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        print(f"[✓] Config saved to {CONFIG_PATH}")
+    except Exception as e:
+        print(f"[!] Failed to save config.json: {e}")
+
+    return cfg
+
+
+CFG = load_or_init_config()
+
+API_ID = int(CFG["API_ID"])
+API_HASH = CFG["API_HASH"]
+MONGO_URI = CFG["MONGO_URI"]
+DB_NAME = CFG["DB_NAME"]
 
 mongo = MongoClient(MONGO_URI)
 db = mongo[DB_NAME]
 users = db.users          # users collection
 codes = db.plan_codes     # subscription codes collection
 
-DEFAULT_TZ = "Asia/Kolkata"
 
 # --------------------
 # Helpers
@@ -392,7 +446,7 @@ def start_runner():
     If you use systemd instead, you can ignore this.
     """
     print("\n--- Start runner ---")
-    cmd = os.getenv("RUNNER_CMD", "python3 runner.py")
+    cmd = "python3 runner.py"
     print(f"Starting: {cmd}")
     try:
         subprocess.Popen(cmd.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
