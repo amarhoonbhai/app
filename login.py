@@ -8,16 +8,19 @@ from datetime import datetime, timedelta
 from getpass import getpass
 import subprocess
 
-from pymongo import MongoClient
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+BASE_DIR = os.path.dirname(__file__)
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+USERS_DIR = os.path.join(BASE_DIR, "users")
+CODES_PATH = os.path.join(BASE_DIR, "plan_codes.json")
 DEFAULT_TZ = "Asia/Kolkata"
 
+
 # --------------------
-# Config handling (no .env)
+# Config handling (no .env, no Mongo)
 # --------------------
 def load_or_init_config() -> dict:
     cfg: dict = {}
@@ -30,39 +33,32 @@ def load_or_init_config() -> dict:
         except Exception:
             cfg = {}
 
-    def ask(key: str, label: str, cast=str, default=None):
+    def ask(key: str, label: str, cast=str):
         # If already in config and looks valid, keep it
         if key in cfg and cfg[key]:
             return
 
         while True:
-            prompt = label
-            if default is not None:
-                prompt += f" [{default}]"
-            prompt += ": "
-
-            val = input(prompt).strip()
-            if not val and default is not None:
-                val = default
-
+            val = input(label + ": ").strip()
+            if not val:
+                print("This value cannot be empty.")
+                continue
             if cast is int:
                 try:
                     val = int(val)
                 except ValueError:
                     print("Please enter a valid integer.")
                     continue
-            if not val:
-                print("This value cannot be empty.")
-                continue
             cfg[key] = val
             break
 
-    print("=== Spinify CLI Setup (first run) ===" if not cfg else "=== Loaded config.json ===")
+    if not cfg:
+        print("=== Spinify CLI Setup (first run) ===")
+    else:
+        print("=== Loaded config.json ===")
 
     ask("API_ID", "Telegram API ID", cast=int)
     ask("API_HASH", "Telegram API Hash", cast=str)
-    ask("MONGO_URI", "Mongo URI", cast=str, default="mongodb://localhost:27017/")
-    ask("DB_NAME", "Mongo DB Name", cast=str, default="spinify")
 
     # Save back to file
     try:
@@ -78,24 +74,90 @@ def load_or_init_config() -> dict:
 CFG = load_or_init_config()
 
 API_ID = int(CFG["API_ID"])
-API_HASH = CFG["API_HASH"]
-MONGO_URI = CFG["MONGO_URI"]
-DB_NAME = CFG["DB_NAME"]
+API_HASH = str(CFG["API_HASH"])
 
-mongo = MongoClient(MONGO_URI)
-db = mongo[DB_NAME]
-users = db.users          # users collection
-codes = db.plan_codes     # subscription codes collection
+os.makedirs(USERS_DIR, exist_ok=True)
 
 
 # --------------------
-# Helpers
+# Helpers: users & codes
 # --------------------
+def user_file_path(phone: str) -> str:
+    safe = phone.replace(" ", "")
+    return os.path.join(USERS_DIR, f"{safe}.json")
+
+
+def load_user(phone: str) -> dict | None:
+    path = user_file_path(phone)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_user(user: dict) -> None:
+    phone = user.get("phone")
+    if not phone:
+        return
+    path = user_file_path(phone)
+    user["updated_at"] = datetime.utcnow().isoformat()
+    if "created_at" not in user:
+        user["created_at"] = user["updated_at"]
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(user, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to save user {phone}: {e}")
+
+
+def get_all_users() -> list[dict]:
+    users: list[dict] = []
+    for name in os.listdir(USERS_DIR):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(USERS_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                u = json.load(f)
+                users.append(u)
+        except Exception:
+            continue
+    # sort by created_at if present
+    users.sort(key=lambda u: u.get("created_at", ""))
+    return users
+
+
+def load_codes() -> list[dict]:
+    if not os.path.exists(CODES_PATH):
+        return []
+    try:
+        with open(CODES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def save_codes(codes: list[dict]) -> None:
+    try:
+        with open(CODES_PATH, "w", encoding="utf-8") as f:
+            json.dump(codes, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to save plan codes: {e}")
+
+
 def generate_code(length: int = 10) -> str:
     alphabet = string.ascii_uppercase + string.digits
+    codes = load_codes()
+    existing = {c.get("code") for c in codes}
     while True:
         c = "".join(random.choice(alphabet) for _ in range(length))
-        if not codes.find_one({"code": c}):
+        if c not in existing:
             return c
 
 
@@ -114,7 +176,8 @@ def parse_date(prompt: str) -> datetime:
 
 def parse_hour(prompt: str, default: int | None = None) -> int:
     while True:
-        val = input(prompt + (f" [{default}]" if default is not None else "") + ": ").strip()
+        suffix = f" [{default}]" if default is not None else ""
+        val = input(prompt + suffix + ": ").strip()
         if not val and default is not None:
             return default
         if not val:
@@ -129,10 +192,6 @@ def parse_hour(prompt: str, default: int | None = None) -> int:
             print("Invalid number, try again.")
 
 
-def get_all_users():
-    return list(users.find().sort("created_at", 1))
-
-
 def choose_user() -> dict | None:
     all_users = get_all_users()
     if not all_users:
@@ -144,7 +203,14 @@ def choose_user() -> dict | None:
         phone = u.get("phone")
         name = u.get("name") or ""
         plan_expiry = u.get("plan_expiry")
-        plan_str = plan_expiry.strftime("%Y-%m-%d") if plan_expiry else "∞"
+        if plan_expiry:
+            try:
+                dt = datetime.fromisoformat(plan_expiry)
+                plan_str = dt.strftime("%Y-%m-%d")
+            except Exception:
+                plan_str = str(plan_expiry)
+        else:
+            plan_str = "∞"
         active = "YES" if u.get("active", True) else "NO"
         print(f"{idx}) {phone} | {name} | plan till: {plan_str} | active: {active}")
 
@@ -182,7 +248,15 @@ def list_users():
         end = auto.get("end", "07:00")
         active = u.get("active", True)
 
-        plan_str = plan_expiry.strftime("%Y-%m-%d") if plan_expiry else "∞"
+        if plan_expiry:
+            try:
+                dt = datetime.fromisoformat(plan_expiry)
+                plan_str = dt.strftime("%Y-%m-%d")
+            except Exception:
+                plan_str = str(plan_expiry)
+        else:
+            plan_str = "∞"
+
         print(
             f"- {phone} | {name} | plan: {plan_name} till {plan_str} | "
             f"auto-night: {'ON' if auto_enabled else 'OFF'} ({start}→{end}) | "
@@ -197,9 +271,8 @@ def login_new_user():
         print("Phone cannot be empty.")
         return
 
-    existing = users.find_one({"phone": phone})
-    if existing:
-        print("User with this phone already exists in DB.")
+    if load_user(phone):
+        print("User with this phone already exists.")
         return
 
     name = input("Name/label for this account (for your reference): ").strip() or phone
@@ -223,10 +296,11 @@ def login_new_user():
 
     # Initial plan
     use_plan = input("Set an initial plan expiry now? (y/N): ").strip().lower()
-    plan_expiry = None
+    plan_expiry_iso = None
     plan_name = "free"
     if use_plan == "y":
-        plan_expiry = parse_date("Plan expiry date (YYYY-MM-DD): ")
+        plan_expiry_dt = parse_date("Plan expiry date (YYYY-MM-DD): ")
+        plan_expiry_iso = plan_expiry_dt.isoformat()
         plan_name = input("Plan label (e.g. PRO30): ").strip() or "custom"
 
     # Per-user auto-night (structure compatible with runner.py)
@@ -248,25 +322,24 @@ def login_new_user():
             "tz": DEFAULT_TZ,
         }
 
-    now = datetime.utcnow()
-    users.insert_one(
-        {
-            "phone": phone,
-            "name": name,
-            "string_session": session_str,
-            "plan_name": plan_name,
-            "plan_expiry": plan_expiry,  # None = unlimited
-            "auto_night": auto_cfg,
-            "groups": [],  # will be updated via .addgroup inside runner.py
-            "settings": {
-                "msg_delay_sec": 5,
-                "cycle_delay_min": 15,
-            },
-            "active": True,
-            "created_at": now,
-            "updated_at": now,
-        }
-    )
+    now_iso = datetime.utcnow().isoformat()
+    user = {
+        "phone": phone,
+        "name": name,
+        "string_session": session_str,
+        "plan_name": plan_name,
+        "plan_expiry": plan_expiry_iso,  # None = unlimited
+        "auto_night": auto_cfg,
+        "groups": [],  # will be updated via .addgroup inside runner.py
+        "settings": {
+            "msg_delay_sec": 5,
+            "cycle_delay_min": 15,
+        },
+        "active": True,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    save_user(user)
     print(f"[+] User {phone} added.")
 
 
@@ -279,8 +352,14 @@ def delete_user():
     if sure != "y":
         print("Cancelled.")
         return
-    users.delete_one({"_id": user["_id"]})
-    print(f"[x] Deleted user {phone} from DB.")
+    path = user_file_path(phone)
+    try:
+        os.remove(path)
+        print(f"[x] Deleted user {phone}.")
+    except FileNotFoundError:
+        print("User file not found (already deleted?).")
+    except Exception as e:
+        print(f"[!] Failed to delete user file: {e}")
 
 
 def show_auto_night():
@@ -354,10 +433,8 @@ def edit_auto_night():
             "tz": tz,
         }
 
-    users.update_one(
-        {"_id": user["_id"]},
-        {"$set": {"auto_night": new_auto, "updated_at": datetime.utcnow()}},
-    )
+    user["auto_night"] = new_auto
+    save_user(user)
     print("[✓] Auto-Night updated.")
 
 
@@ -365,20 +442,24 @@ def generate_plan_code():
     print("\n--- Generate plan code ---")
     plan_name = input("Plan label (e.g. PRO30): ").strip() or "custom"
     expiry_dt = parse_date("Plan expiry (YYYY-MM-DD): ")
+    expiry_iso = expiry_dt.isoformat()
 
     code = generate_code(10)
 
-    codes.insert_one(
+    codes = load_codes()
+    codes.append(
         {
             "code": code,
             "plan_name": plan_name,
-            "plan_expiry": expiry_dt,  # datetime (runner expects datetime)
+            "plan_expiry": expiry_iso,
             "used": False,
             "used_by": None,
             "used_at": None,
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.utcnow().isoformat(),
         }
     )
+    save_codes(codes)
+
     print("\n[+] Code generated:")
     print(f"  Code       : {code}")
     print(f"  Plan       : {plan_name}")
@@ -397,46 +478,47 @@ def redeem_plan_code():
         print("Code cannot be empty.")
         return
 
-    code_doc = codes.find_one({"code": code_str})
+    codes = load_codes()
+    idx = None
+    code_doc = None
+    for i, c in enumerate(codes):
+        if c.get("code") == code_str:
+            idx = i
+            code_doc = c
+            break
+
     if not code_doc:
         print("Invalid code.")
         return
     if code_doc.get("used"):
         used_by = code_doc.get("used_by")
-        print(f"This code has already been used (user_id={used_by}).")
+        print(f"This code has already been used (used_by={used_by}).")
         return
 
-    plan_expiry = code_doc["plan_expiry"]
+    plan_expiry_iso = code_doc["plan_expiry"]
     plan_name = code_doc.get("plan_name", "custom")
 
     # Update user
-    users.update_one(
-        {"_id": user["_id"]},
-        {
-            "$set": {
-                "plan_name": plan_name,
-                "plan_expiry": plan_expiry,
-                "updated_at": datetime.utcnow(),
-            }
-        },
-    )
+    user["plan_name"] = plan_name
+    user["plan_expiry"] = plan_expiry_iso
+    save_user(user)
 
     # Mark code used
-    codes.update_one(
-        {"_id": code_doc["_id"]},
-        {
-            "$set": {
-                "used": True,
-                "used_by": user["_id"],
-                "used_at": datetime.utcnow(),
-            }
-        },
-    )
+    codes[idx]["used"] = True
+    codes[idx]["used_by"] = user.get("phone")
+    codes[idx]["used_at"] = datetime.utcnow().isoformat()
+    save_codes(codes)
+
+    try:
+        exp_dt = datetime.fromisoformat(plan_expiry_iso)
+        exp_str = exp_dt.strftime("%Y-%m-%d")
+    except Exception:
+        exp_str = str(plan_expiry_iso)
 
     phone = user.get("phone")
     print(
         f"[✓] Code applied to user {phone}. "
-        f"Plan `{plan_name}` valid till {plan_expiry.strftime('%Y-%m-%d')}."
+        f"Plan `{plan_name}` valid till {exp_str}."
     )
 
 
