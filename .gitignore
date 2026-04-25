@@ -1,0 +1,9 @@
+# Sessions and sensitive data
+sessions/
+users/
+*.session
+*.json
+!requirements.txt
+runner.log
+__pycache__/
+.env

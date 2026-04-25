@@ -5,7 +5,9 @@ import logging
 import sqlite3
 import re
 from datetime import datetime, date, time, timedelta
-from typing import Tuple
+from typing import Tuple, List, Optional
+import random
+
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -13,7 +15,15 @@ except Exception:
     ZoneInfo = None  # will fall back to local time without TZ
 
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError, RPCError
+from telethon.errors import (
+    SessionPasswordNeededError, 
+    RPCError, 
+    FloodWaitError, 
+    ChatWriteForbiddenError,
+    SlowModeWaitError
+)
+import telethon.utils as tel_utils
+
 
 # =========================
 # Auto-Night configuration
@@ -21,10 +31,11 @@ from telethon.errors import SessionPasswordNeededError, RPCError
 AUTONIGHT_PATH = os.path.join(os.path.dirname(__file__), "autonight.json")
 DEFAULT_AUTONIGHT = {
     "enabled": True,
-    "start": "23:00",        # 24h format HH:MM
-    "end": "07:00",          # 24h format HH:MM
+    "start": "00:00",        # 24h format HH:MM
+    "end": "06:00",          # 24h format HH:MM
     "tz": "Asia/Kolkata"
 }
+
 
 def _load_autonight() -> dict:
     cfg = DEFAULT_AUTONIGHT.copy()
@@ -113,12 +124,13 @@ def autonight_is_quiet(cfg: dict) -> bool:
         return False
 
 def autonight_status_text(cfg: dict) -> str:
-    state = "ON ✅" if cfg.get("enabled", True) else "OFF ❌"
+    state = "ACTIVE ✅" if cfg.get("enabled", True) else "DISABLED ❌"
     return (
         f"🌙 Auto-Night: **{state}**\n"
-        f"Window: **{cfg.get('start','23:00')} → {cfg.get('end','07:00')}**\n"
+        f"Window: **{cfg.get('start','00:00')} → {cfg.get('end','06:00')}**\n"
         f"TZ: **{cfg.get('tz','Asia/Kolkata')}**"
     )
+
 
 def autonight_parse_command(arg: str, cfg: dict) -> Tuple[str, dict]:
     """
@@ -175,6 +187,8 @@ def autonight_parse_command(arg: str, cfg: dict) -> Tuple[str, dict]:
 # Original forwarder logic
 # =========================
 
+
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -192,37 +206,37 @@ async def run_user_bot(config):
     if phone in started_phones:
         return
 
+    # Track this session to avoid concurrent start attempts
+    started_phones.add(phone)
+
     session_path = os.path.join(SESSIONS_DIR, f"{phone}.session")
     api_id = int(config["api_id"])
     api_hash = config["api_hash"]
     groups = config.get("groups", [])
-    delay = config.get("msg_delay_sec", 5)
+    delay = config.get("msg_delay_sec", 30)
     cycle = config.get("cycle_delay_min", 15)
+
 
     user_state = {
         "delay": delay,   # seconds between forwards
         "cycle": cycle,   # minutes between cycles
+        "use_copy": True, # Copy instead of Forward (removes 'forwarded from' tag)
     }
 
     client = TelegramClient(session_path, api_id, api_hash)
-
     try:
-        await client.start()
-    except sqlite3.OperationalError as e:
-        logger.error(f"[{phone}] SQLite lock error: {e}")
-        return
-    except SessionPasswordNeededError:
-        logger.error(f"[{phone}] 2FA password required. Skipping.")
-        return
-    except RPCError as e:
-        logger.error(f"[{phone}] RPC Error: {e}")
-        return
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.error(f"[{phone}] Session revoked or unauthorized.")
+            started_phones.remove(phone)
+            return
     except Exception as e:
-        logger.exception(f"[{phone}] Failed to start client: {e}")
+        logger.error(f"[{phone}] Connection failure: {e}")
+        started_phones.remove(phone)
         return
 
-    started_phones.add(phone)
     logger.info(f"[✔] Started bot for {config.get('name','N/A')} ({phone})")
+
 
     @client.on(events.NewMessage)
     async def command_handler(event):
@@ -250,7 +264,8 @@ async def run_user_bot(config):
                 await event.respond("❗ Usage: `.delay 5` (seconds)")
                 return
             user_state["delay"] = value
-            await event.respond(f"✅ Message delay set to **{value} seconds**")
+            await event.respond(f"✅ Message delay set to **{value} seconds** (Randomized ±20%)")
+
 
         elif text.startswith(".status"):
             await event.respond(
@@ -262,16 +277,17 @@ async def run_user_bot(config):
 
         elif text.startswith(".info"):
             me = await client.get_me()
-            expiry = "Developer" if me.id == 7876302875 else config.get("plan_expiry", "N/A")
+            expiry = "Lifetime"
             reply = (
                 f"❀ User Info:\n"
                 f"❀ Name: {config.get('name')}\n"
                 f"❀ Cycle Delay: {user_state['cycle']} min\n"
                 f"❀ Message Delay: {user_state['delay']} sec\n"
                 f"❀ Groups: {len(groups)}\n"
-                f"❀ Plan Expiry: {expiry}\n\n"
+                f"❀ Plan Access: {expiry}\n\n"
                 + autonight_status_text(AUTONIGHT_CFG)
             )
+
             await event.respond(reply)
 
         elif text.startswith(".addgroup"):
@@ -322,64 +338,124 @@ async def run_user_bot(config):
                 AUTONIGHT_CFG[k] = new_cfg.get(k, AUTONIGHT_CFG[k])
             await event.respond(msg)
 
+        elif text.startswith(".mode"):
+            if "forward" in text.lower():
+                user_state["use_copy"] = False
+                await event.respond("✅ Mode set to **Forward** (will show 'Forwarded from...')")
+            else:
+                user_state["use_copy"] = True
+                await event.respond("✅ Mode set to **Copy** (looks like a fresh message)")
+
+
+        elif text.startswith(".join"):
+            links = re.findall(r'https://t\.me/\S+', text)
+            if not links:
+                await event.respond("⚠️ Usage: `.join <link1> <link2> ...`")
+                return
+            
+            await event.respond(f"🔄 Attempting to join {len(links)} groups...")
+            success, fail = 0, 0
+            for link in links:
+                try:
+                    # Handle both private and public links
+                    if "t.me/+" in link or "t.me/joinchat/" in link:
+                        from telethon.tl.functions.messages import ImportChatInviteRequest
+                        hash = link.split('/')[-1]
+                        await client(ImportChatInviteRequest(hash))
+                    else:
+                        from telethon.tl.functions.channels import JoinChannelRequest
+                        username = link.split('/')[-1]
+                        await client(JoinChannelRequest(username))
+                    success += 1
+                    await asyncio.sleep(random.randint(10, 20)) # Wait between joins
+                except Exception as e:
+                    logger.error(f"Join error {link}: {e}")
+                    fail += 1
+            await event.respond(f"✅ Done! Joined: **{success}**, Failed: **{fail}**")
+
+
         elif text.startswith(".help"):
             await event.respond(
-                "🛠 Available Commands:\n"
-                "• `.time <10m|1h>` — Set cycle delay (minutes)\n"
-                "• `.delay <sec>` — Set delay between messages\n"
-                "• `.status` — Show timing + Auto-Night\n"
-                "• `.info` — Show full user info\n"
-                "• `.addgroup <url ...>` — Add group(s)\n"
+                "🎁 **TELETHON V5 ELITE ADVANCED MODULE**\n\n"
+                "🛠 **Timing & Mode:**\n"
+                "• `.time <m|h>` — Set cycle interval\n"
+                "• `.delay <sec>` — Set message spacing\n"
+                "• `.mode <copy|forward>` — Switch sending style\n"
+                "\n🛰 **Management:**\n"
+                "• `.addgroup <url>` — Add target group\n"
                 "• `.delgroup <url>` — Remove group\n"
-                "• `.groups` — List groups\n"
-                "• `.night` — Show Auto-Night status\n"
-                "• `.night on|off` — Enable/disable Auto-Night\n"
-                "• `.night 23:00 to 07:00` — Change quiet window (24-hour times)"
+                "• `.groups` — Show target list\n"
+                "• `.join <url>` — Join new groups\n"
+                "\n🌙 **System:**\n"
+                "• `.status` | `.info` | `.night`"
             )
+
+
 
     async def forward_loop():
         while True:
             try:
-                # 🌙 If within quiet hours, sleep until end of window
-                if autonight_is_quiet(AUTONIGHT_CFG):
-                    secs = _seconds_until_quiet_end(AUTONIGHT_CFG)
-                    mins = max(1, secs // 60)
-                    logger.info(f"[{phone}] 🌙 Auto-Night active. Sleeping ~{mins} min (until window ends).")
-                    await asyncio.sleep(secs)
+                # 🌙 If within quiet hours, check every minute if still quiet
+                while autonight_is_quiet(AUTONIGHT_CFG):
+                    secs_to_end = _seconds_until_quiet_end(AUTONIGHT_CFG)
+                    # Sleep max 60s at a time to allow immediate wake-up if config changes
+                    sleep_step = min(secs_to_end, 60)
+                    if sleep_step > 0:
+                        await asyncio.sleep(sleep_step)
+                    else:
+                        break # safety break
+                
+                # 💎 Only get the LATEST message from Saved Messages 
+                messages = await client.get_messages("me", limit=1)
+                
+                if not messages:
+                    logger.info(f"[{phone}] No messages in Saved Messages. Waiting for next cycle.")
+                    await asyncio.sleep(user_state["cycle"] * 60)
                     continue
 
-                messages = await client.get_messages("me", limit=100)
-                messages = list(reversed(messages))
-
+                msg = messages[0]
                 interrupted_by_night = False
 
-                for msg in messages:
-                    if msg.message is None and not msg.media:
-                        continue
-
+                for group in groups:
                     # If night starts mid-cycle, break early
                     if autonight_is_quiet(AUTONIGHT_CFG):
                         interrupted_by_night = True
-                        logger.info(f"[{phone}] Entered Auto-Night mid-cycle. Pausing forwards.")
                         break
 
-                    for group in groups:
-                        try:
+                    try:
+                        if user_state["use_copy"]:
+                            # 🌈 Copy Mode: Sends as a fresh message (No 'Forwarded' Tag)
+                            caption = msg.text or ""
+                            if msg.media:
+                                await client.send_file(group, msg.media, caption=caption)
+                            else:
+                                await client.send_message(group, caption)
+                        else:
+                            # 🔄 Forward Mode
                             await client.forward_messages(group, msg)
-                            logger.info(f"[{phone}] Forwarded to {group}")
-                        except Exception as e:
-                            logger.warning(f"[{phone}] Error forwarding to {group}: {e}")
 
-                    await asyncio.sleep(user_state["delay"])
+                        
+                        logger.info(f"[{phone}] Success -> {group}")
+                        
+                        # ⚡ 30-Second Gap (Randomized ±10% for high stealth)
+                        wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
+                        await asyncio.sleep(wait_time)
+
+
+                    except FloodWaitError as e:
+                        logger.warning(f"[{phone}] FloodWait! Sleeping {e.seconds}s")
+                        await asyncio.sleep(e.seconds + 5)
+                    except SlowModeWaitError as e:
+                        logger.warning(f"[{phone}] Slowmode in {group}. Waiting {e.seconds}s (skipped)")
+                    except ChatWriteForbiddenError:
+                        logger.error(f"[{phone}] Banned or No permission in {group}")
+                    except Exception as e:
+                        logger.error(f"[{phone}] Failed {group}: {type(e).__name__}")
 
                 if interrupted_by_night:
-                    secs = _seconds_until_quiet_end(AUTONIGHT_CFG)
-                    mins = max(1, secs // 60)
-                    logger.info(f"[{phone}] 🌙 Auto-Night active. Sleeping ~{mins} min.")
-                    await asyncio.sleep(secs)
                     continue
 
-                logger.info(f"[{phone}] Cycle complete. Sleeping for {user_state['cycle']} minutes...")
+                logger.info(f"[{phone}] Cycle complete ({len(groups)} groups). Next in {user_state['cycle']}m.")
                 await asyncio.sleep(user_state["cycle"] * 60)
 
             except Exception as e:
@@ -397,11 +473,9 @@ async def user_loader():
                 try:
                     with open(path, 'r', encoding="utf-8") as f:
                         config = json.load(f)
-                        expiry = config.get("plan_expiry")
-                        if expiry and datetime.now() > datetime.fromisoformat(expiry):
-                            logger.info(f"[⏳] Plan expired for {config['phone']}. Skipping.")
-                            continue
+                        # Plan check completely removed for Lifetime access
                         asyncio.create_task(run_user_bot(config))
+
                 except Exception as e:
                     logger.error(f"Error loading user config {file}: {e}")
         await asyncio.sleep(60)
