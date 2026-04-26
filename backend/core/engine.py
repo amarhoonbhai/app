@@ -51,7 +51,8 @@ class ForwardingEngine:
                 if event.raw_text.startswith(".stats"):
                     await self.send_stats(event)
                 elif event.raw_text.startswith(".help"):
-                    await event.respond("🛠 **Elite V6 Commands**\n`.stats` - Real-time statistics\n`.help` - Show this menu")
+                    res = await event.respond("🛠 **Elite V6 Commands**\n`.stats` - Real-time statistics\n`.help` - Show this menu")
+                    await self.auto_delete(event, res)
 
             self.loop_task = asyncio.create_task(self.forward_loop())
             await self.client.run_until_disconnected()
@@ -67,8 +68,9 @@ class ForwardingEngine:
         acc = db.query(Account).filter(Account.id == self.account_id).first()
         
         if not stats or not acc:
-            await event.respond("❌ Stats not available.")
+            res = await event.respond("❌ Stats not available.")
             db.close()
+            await self.auto_delete(event, res)
             return
 
         next_time = stats.next_msg_at.strftime("%H:%M:%S") if stats.next_msg_at else "N/A"
@@ -88,8 +90,19 @@ class ForwardingEngine:
             f"📝 **Recent Logs:**\n"
             f"```{log_text}```"
         )
-        await event.respond(reply)
+        res = await event.respond(reply)
         db.close()
+        await self.auto_delete(event, res)
+
+    async def auto_delete(self, event, response, delay=50):
+        """Wait for delay and then delete the command and response."""
+        await asyncio.sleep(delay)
+        try:
+            await event.delete()
+        except: pass
+        try:
+            await response.delete()
+        except: pass
 
     async def forward_loop(self):
         while self.is_running:

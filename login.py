@@ -88,8 +88,15 @@ def add_account():
     os.makedirs("sessions", exist_ok=True)
     session_path = os.path.join("sessions", f"{phone}")
     
-    # We create a fresh client
-    client = TelegramClient(session_path, int(api_id), api_hash)
+    # We create a fresh client with standard device info to avoid being flagged
+    client = TelegramClient(
+        session_path, 
+        int(api_id), 
+        api_hash,
+        system_version="4.16.30-vxCUSTOM",
+        device_model="Desktop",
+        app_version="1.10.0"
+    )
     
     try:
         print(Fore.YELLOW + "  [~] Connecting to Telegram...")
@@ -99,8 +106,14 @@ def add_account():
             print(Fore.YELLOW + f"  [~] Requesting OTP for {phone}...")
             try:
                 # Explicitly request the code
-                client.send_code_request(phone)
-                print(Fore.GREEN + "  [✔] Code sent! Please check your Telegram app or SMS.")
+                sent_code = client.send_code_request(phone)
+                
+                # Identify where the code was sent
+                from telethon.tl.types import SentCodeTypeApp, SentCodeTypeSms
+                where = "Telegram App" if isinstance(sent_code.type, SentCodeTypeApp) else "SMS"
+                
+                print(Fore.GREEN + f"  [✔] Code sent via {where}!")
+                print(Fore.GREEN + "  [!] Please check your device now.")
             except FloodWaitError as e:
                 print(Fore.RED + f"  [!] Flood Wait: Must wait {e.seconds}s before requesting again.")
                 input()
