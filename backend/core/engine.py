@@ -130,13 +130,25 @@ class ForwardingEngine:
                         stats.success_total += 1
                         stats.current_cycle_success += 1
                         self.log_event(f"Delivered to {group}")
+                    except FloodWaitError as e:
+                        self.log_event(f"FloodWait! Sleeping {e.seconds}s", "warning")
+                        self.update_status(db, stats, f"FloodWait ({e.seconds}s)")
+                        await asyncio.sleep(e.seconds + 5)
+                        # We don't increment fail here because we want to retry or just continue
+                    except SlowModeWaitError as e:
+                        self.log_event(f"SlowMode in {group}. Waiting {e.seconds}s", "warning")
+                        await asyncio.sleep(e.seconds)
+                    except ChatWriteForbiddenError:
+                        stats.fail_total += 1
+                        stats.current_cycle_fail += 1
+                        self.log_event(f"Banned/No permission in {group}", "error")
                     except Exception as e:
                         stats.fail_total += 1
                         stats.current_cycle_fail += 1
                         self.log_event(f"Failed {group}: {type(e).__name__}", "warning")
 
-                    # Delay between groups
-                    delay = acc.msg_delay_sec * random.uniform(0.9, 1.1)
+                    # Delay between groups (skipped if we already slept for Flood/Slowmode)
+                    delay = acc.msg_delay_sec * random.uniform(0.8, 1.2)
                     stats.next_msg_at = datetime.now() + timedelta(seconds=delay)
                     db.commit()
                     await asyncio.sleep(delay)

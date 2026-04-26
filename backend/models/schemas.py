@@ -7,8 +7,8 @@ class AccountBase(BaseModel):
     name: str
     api_id: int
     api_hash: str
-    cycle_delay_min: int = 15
-    msg_delay_sec: int = 30
+    cycle_delay_min: int = 20
+    msg_delay_sec: int = 300
     use_copy: bool = True
 
 class AccountCreate(AccountBase):
