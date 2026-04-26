@@ -210,7 +210,7 @@ async def run_user_bot(config):
     api_id = int(config["api_id"])
     api_hash = config["api_hash"]
     groups = config.get("groups", [])
-    delay = config.get("msg_delay_sec", 300)
+    delay = config.get("msg_delay_sec", 20)
     cycle = config.get("cycle_delay_min", 20)
 
     user_state = {
@@ -292,12 +292,12 @@ async def run_user_bot(config):
         elif text.startswith(".delay"):
             value = int(''.join(filter(str.isdigit, text)) or "0")
             if value <= 0:
-                await event.respond("❗ Usage: `.delay 300` (seconds)")
+                await event.respond("❗ Usage: `.delay 20` (seconds)")
                 return
             
-            if value < 300:
-                await event.respond("⚠️ Minimum message delay is **300 seconds (5 min)**. Setting to 300s.")
-                value = 300
+            if value < 20:
+                await event.respond("⚠️ Minimum message delay is **20 seconds**. Setting to 20s.")
+                value = 20
                 
             user_state["delay"] = value
             await event.respond(f"✅ Message delay set to **{value} seconds** (Randomized ±10%)")
@@ -467,9 +467,9 @@ async def run_user_bot(config):
                     else:
                         break # safety break
                 
-                # 💎 Only get the LATEST message from Saved Messages 
-                user_state["status"] = "Fetching Msg 🔍"
-                messages = await client.get_messages("me", limit=1)
+                # 💎 Fetch all messages from Saved Messages (up to 100)
+                user_state["status"] = "Fetching Msgs 🔍"
+                messages = await client.get_messages("me", limit=100)
                 
                 if not messages:
                     log_event("No messages in Saved Messages.")
@@ -478,60 +478,70 @@ async def run_user_bot(config):
                     await asyncio.sleep(user_state["cycle"] * 60)
                     continue
 
-                msg = messages[0]
-                interrupted_by_night = False
-                
-                user_state["current_cycle_success"] = 0
-                user_state["current_cycle_fail"] = 0
+                # Forward messages one by one
+                for msg_idx, msg in enumerate(messages, 1):
+                    log_event(f"Processing message {msg_idx}/{len(messages)}")
+                    interrupted_by_night = False
+                    
+                    user_state["current_cycle_success"] = 0
+                    user_state["current_cycle_fail"] = 0
 
-                for i, group in enumerate(groups, 1):
-                    # If night starts mid-cycle, break early
-                    if autonight_is_quiet(AUTONIGHT_CFG):
-                        interrupted_by_night = True
-                        break
+                    for i, group in enumerate(groups, 1):
+                        # If night starts mid-cycle, break early
+                        if autonight_is_quiet(AUTONIGHT_CFG):
+                            interrupted_by_night = True
+                            break
 
-                    user_state["status"] = f"Forwarding {i}/{len(groups)} 📡"
-                    try:
-                        if user_state["use_copy"]:
-                            # 🌈 Copy Mode: Sends as a fresh message (No 'Forwarded' Tag)
-                            caption = msg.text or ""
-                            if msg.media:
-                                await client.send_file(group, msg.media, caption=caption)
+                        user_state["status"] = f"Msg {msg_idx} -> Grp {i}/{len(groups)} 📡"
+                        try:
+                            if user_state["use_copy"]:
+                                # 🌈 Copy Mode
+                                caption = msg.text or ""
+                                if msg.media:
+                                    await client.send_file(group, msg.media, caption=caption)
+                                else:
+                                    await client.send_message(group, caption)
                             else:
-                                await client.send_message(group, caption)
-                        else:
-                            # 🔄 Forward Mode
-                            await client.forward_messages(group, msg)
+                                # 🔄 Forward Mode
+                                await client.forward_messages(group, msg)
 
-                        user_state["success_total"] += 1
-                        user_state["current_cycle_success"] += 1
-                        log_event(f"Success -> {group}")
-                        
-                        # ⚡ randomized delay
-                        wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
-                        user_state["next_msg_at"] = datetime.now() + timedelta(seconds=wait_time)
-                        await asyncio.sleep(wait_time)
+                            user_state["success_total"] += 1
+                            user_state["current_cycle_success"] += 1
+                            log_event(f"Msg {msg_idx} Success -> {group}")
+                            
+                            # ⚡ 20 sec group gap (randomized ±10%)
+                            wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
+                            user_state["next_msg_at"] = datetime.now() + timedelta(seconds=wait_time)
+                            await asyncio.sleep(wait_time)
 
+                        except FloodWaitError as e:
+                            log_event(f"FloodWait! Sleeping {e.seconds}s")
+                            user_state["status"] = f"FloodWait ⏳ ({e.seconds}s)"
+                            await asyncio.sleep(e.seconds + 5)
+                        except SlowModeWaitError as e:
+                            log_event(f"Slowmode in {group}. Waiting {e.seconds}s")
+                            await asyncio.sleep(e.seconds + 2)
+                        except ChatWriteForbiddenError:
+                            log_event(f"No permission in {group}")
+                            user_state["fail_total"] += 1
+                            user_state["current_cycle_fail"] += 1
+                        except Exception as e:
+                            log_event(f"Failed {group}: {type(e).__name__}")
+                            user_state["fail_total"] += 1
+                            user_state["current_cycle_fail"] += 1
 
-                    except FloodWaitError as e:
-                        log_event(f"FloodWait! Sleeping {e.seconds}s")
-                        user_state["status"] = f"FloodWait ⏳ ({e.seconds}s)"
-                        await asyncio.sleep(e.seconds + 5)
-                    except SlowModeWaitError as e:
-                        log_event(f"Slowmode in {group}. Waiting {e.seconds}s")
-                    except ChatWriteForbiddenError:
-                        log_event(f"No permission in {group}")
-                        user_state["fail_total"] += 1
-                        user_state["current_cycle_fail"] += 1
-                    except Exception as e:
-                        log_event(f"Failed {group}: {type(e).__name__}")
-                        user_state["fail_total"] += 1
-                        user_state["current_cycle_fail"] += 1
+                    if interrupted_by_night:
+                        break # exit message loop and go back to outer while True
 
-                if interrupted_by_night:
-                    continue
+                    log_event(f"Msg {msg_idx} cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
+                    
+                    # Interval delay between different messages
+                    if msg_idx < len(messages):
+                        user_state["status"] = f"Waiting for next msg ⏳"
+                        user_state["next_msg_at"] = datetime.now() + timedelta(minutes=user_state["cycle"])
+                        await asyncio.sleep(user_state["cycle"] * 60)
 
-                log_event(f"Cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
+                # After all messages are processed, wait the cycle delay again before checking for new messages
                 user_state["status"] = "Idle 😴"
                 user_state["next_msg_at"] = datetime.now() + timedelta(minutes=user_state["cycle"])
                 await asyncio.sleep(user_state["cycle"] * 60)
