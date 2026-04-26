@@ -103,32 +103,11 @@ def add_account():
         client.connect()
         
         if not client.is_user_authorized():
-            print(Fore.YELLOW + f"  [~] Requesting OTP for {phone}...")
-            try:
-                # Explicitly request the code
-                sent_code = client.send_code_request(phone)
-                
-                # Identify where the code was sent
-                from telethon.tl.types.auth import SentCodeTypeApp, SentCodeTypeSms
-                where = "Telegram App" if isinstance(sent_code.type, SentCodeTypeApp) else "SMS"
-                
-                print(Fore.GREEN + f"  [✔] Code sent via {where}!")
-                print(Fore.GREEN + "  [!] Please check your device now.")
-            except FloodWaitError as e:
-                print(Fore.RED + f"  [!] Flood Wait: Must wait {e.seconds}s before requesting again.")
-                input()
-                return
-            except Exception as e:
-                print(Fore.RED + f"  [!] Failed to send code: {e}")
-                input()
-                return
-
-            code = input(Fore.YELLOW + "  ❯ Enter the Code: ").strip()
-            try:
-                client.sign_in(phone, code)
-            except SessionPasswordNeededError:
-                pw = input(Fore.YELLOW + "  ❯ 2FA Password Required: ").strip()
-                client.sign_in(password=pw)
+            print(Fore.YELLOW + "  [~] Requesting OTP (check your Telegram App)...")
+            # client.start() is the most reliable way as it handles the full flow
+            client.start(phone=phone)
+        
+        me = client.get_me()
         
         me = client.get_me()
         user_display = (getattr(me, "first_name", "") or getattr(me, "username", "") or str(me.id))
