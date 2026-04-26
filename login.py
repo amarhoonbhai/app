@@ -1,8 +1,9 @@
-#!/usr/bin/env python3
 import os
 import re
 import json
 import subprocess
+import tempfile
+import shutil
 from datetime import datetime, timedelta, time
 from typing import Dict, Any
 
@@ -30,6 +31,23 @@ AUTONIGHT_DEFAULT = {
     "tz": "Asia/Kolkata"
 }
 
+def atomic_save_json(path: str, data: Any) -> bool:
+    """Save JSON data to a file atomically using a temporary file."""
+    temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            os.replace(temp_path, path)
+        except OSError:
+            shutil.move(temp_path, path)
+        return True
+    except Exception as e:
+        print(Fore.RED + f"  [!] Failed to save JSON to {path}: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return False
+
 
 RUNNER_CMD = ["python3", "runner.py"]
 RUNNER_LOG = "runner.log"
@@ -46,12 +64,13 @@ def ensure_dirs():
             json.dump(AUTONIGHT_DEFAULT, f, ensure_ascii=False, indent=2)
 
 def load_users() -> Dict[str, Any]:
+    if not os.path.exists(USERS_FILE):
+        return {}
     with open(USERS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_users(users: Dict[str, Any]) -> None:
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+    atomic_save_json(USERS_FILE, users)
 
 def save_user_config(phone: str, data: Dict[str, Any]) -> None:
     user_config = {
@@ -66,8 +85,7 @@ def save_user_config(phone: str, data: Dict[str, Any]) -> None:
         "plan_expiry": "Lifetime"
     }
 
-    with open(os.path.join(USERS_DIR, f"{phone}.json"), "w", encoding="utf-8") as f:
-        json.dump(user_config, f, ensure_ascii=False, indent=2)
+    atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), user_config)
 
 # ---------- UI Helpers ----------
 def list_users(users: Dict[str, Any]) -> None:
@@ -87,14 +105,14 @@ def list_users(users: Dict[str, Any]) -> None:
 def is_runner_running() -> bool:
     try:
         if os.name == 'nt':
-            # Windows: Check if runner.py is in the command line, excluding the current check process
-            try:
-                # We look for 'python' and 'runner.py' in the command line, but exclude 'powershell' which is likely this check
-                cmd = 'powershell "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*runner.py*\' -and $_.Name -ne \'powershell.exe\' -and $_.Name -ne \'cmd.exe\' } | Select-Object -Property ProcessId"'
-                output = subprocess.check_output(cmd, shell=True).decode('cp1252', 'ignore').strip()
-                return len(output) > 0
-            except:
-                return False
+            # Windows: More robust check using tasklist
+            cmd = 'tasklist /FI "IMAGENAME eq python.exe" /FO CSV'
+            output = subprocess.check_output(cmd, shell=True).decode('cp1252', 'ignore')
+            # Check if any python process has 'runner.py' in its command line is hard with tasklist,
+            # but we can try wmic or just stick to the previous one with a fix.
+            cmd = 'powershell "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*runner.py*\' } | Select-Object -Property ProcessId"'
+            output = subprocess.check_output(cmd, shell=True).decode('cp1252', 'ignore').strip()
+            return len(output) > 0
         else:
             # Linux: Check pgrep
             out = subprocess.run(
@@ -190,8 +208,7 @@ def edit_autonight():
     if tz_in:
         cfg["tz"] = tz_in
 
-    with open(AUTONIGHT_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    atomic_save_json(AUTONIGHT_FILE, cfg)
     print(Fore.GREEN + "  [✔] Auto-Night settings updated.")
     show_autonight()
 

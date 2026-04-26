@@ -5,8 +5,11 @@ import logging
 import sqlite3
 import re
 import random
+import signal
+import tempfile
+import shutil
 from datetime import datetime, date, time, timedelta
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Any
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -39,6 +42,26 @@ DEFAULT_AUTONIGHT = {
 }
 
 
+def atomic_save_json(path: str, data: Any) -> bool:
+    """Save JSON data to a file atomically using a temporary file."""
+    temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        # On Windows, os.replace might fail if the destination exists and is open
+        # but shutil.move/os.replace is generally the way to go.
+        try:
+            os.replace(temp_path, path)
+        except OSError:
+            # Fallback if os.replace fails (e.g. permission issues on some environments)
+            shutil.move(temp_path, path)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save JSON to {path}: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return False
+
 def _load_autonight() -> dict:
     cfg = DEFAULT_AUTONIGHT.copy()
     try:
@@ -51,11 +74,7 @@ def _load_autonight() -> dict:
     return cfg
 
 def _save_autonight(cfg: dict) -> None:
-    try:
-        with open(AUTONIGHT_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    atomic_save_json(AUTONIGHT_PATH, cfg)
 
 def _parse_hhmm(s: str) -> time:
     s = s.strip()
@@ -227,11 +246,13 @@ async def run_user_bot(config):
         "next_msg_at": None,
         "status": "Idle 😴",
         "logs": [],
-        "start_time": datetime.now()
+        "start_time": _get_now_tz(AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"]))
     }
 
     def log_event(msg):
-        ts = datetime.now().strftime("%H:%M:%S")
+        tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+        now = _get_now_tz(tz)
+        ts = now.strftime("%H:%M:%S")
         
         # Determine color and icon
         color = Fore.WHITE
@@ -336,9 +357,22 @@ async def run_user_bot(config):
             )
 
         elif text.startswith(".stats"):
-            uptime = str(datetime.now() - user_state["start_time"]).split('.')[0]
-            next_msg = user_state["next_msg_at"].strftime("%H:%M:%S") if user_state["next_msg_at"] else "N/A"
+            tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+            now = _get_now_tz(tz)
+            uptime = str(now - user_state["start_time"]).split('.')[0]
             
+            # Formatting next delivery time
+            next_msg_str = "N/A"
+            if user_state["next_msg_at"]:
+                next_msg_str = user_state["next_msg_at"].strftime("%H:%M:%S")
+            
+            # Label change based on status
+            next_label = "🕒 Next Delivery"
+            if "Idle" in user_state["status"] or "Waiting" in user_state["status"]:
+                next_label = "🕒 Next Cycle"
+            elif "Msg" in user_state["status"]:
+                next_label = "🕒 Next Group"
+
             log_text = "\n".join(user_state["logs"][-5:]) if user_state["logs"] else "No logs yet."
             
             reply = (
@@ -351,7 +385,7 @@ async def run_user_bot(config):
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"✅ **Total Success:** `{user_state['success_total']}`\n"
                 f"❌ **Total Failed:** `{user_state['fail_total']}`\n"
-                f"🕒 **Next Delivery:** `{next_msg}`\n"
+                f"{next_label}: `{next_msg_str}`\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"📜 **Recent Logs:**\n`{log_text}`"
             )
@@ -476,6 +510,7 @@ async def run_user_bot(config):
 
 
     async def forward_loop():
+        tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
         while True:
             try:
                 # 🌙 If within quiet hours, check every minute if still quiet
@@ -496,7 +531,8 @@ async def run_user_bot(config):
                 if not messages:
                     log_event("No messages in Saved Messages.")
                     user_state["status"] = "Idle (No Msg) 😴"
-                    user_state["next_msg_at"] = datetime.now() + timedelta(minutes=user_state["cycle"])
+                    now = _get_now_tz(tz)
+                    user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
                     await asyncio.sleep(user_state["cycle"] * 60)
                     continue
 
@@ -533,12 +569,15 @@ async def run_user_bot(config):
                             
                             # ⚡ 20 sec group gap (randomized ±10%)
                             wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
-                            user_state["next_msg_at"] = datetime.now() + timedelta(seconds=wait_time)
+                            now = _get_now_tz(tz)
+                            user_state["next_msg_at"] = now + timedelta(seconds=wait_time)
                             await asyncio.sleep(wait_time)
 
                         except FloodWaitError as e:
-                            log_event(f"FloodWait! Sleeping {e.seconds}s")
+                            log_event(f"FloodWait! Sleeping {e.seconds}s. Increasing delay.")
                             user_state["status"] = f"FloodWait ⏳ ({e.seconds}s)"
+                            # Safer: increase delay for future messages
+                            user_state["delay"] = min(user_state["delay"] + 20, 600)
                             await asyncio.sleep(e.seconds + 5)
                         except SlowModeWaitError as e:
                             log_event(f"Slowmode in {group}. Waiting {e.seconds}s")
@@ -555,17 +594,24 @@ async def run_user_bot(config):
                     if interrupted_by_night:
                         break # exit message loop and go back to outer while True
 
+                    # Adaptive optimization: If cycle was perfect, slightly reduce delay (but not below 20s)
+                    if user_state["current_cycle_fail"] == 0 and user_state["current_cycle_success"] > 0:
+                        if user_state["delay"] > 25:
+                            user_state["delay"] -= 2
+
                     log_event(f"Msg {msg_idx} cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
                     
                     # Interval delay between different messages
                     if msg_idx < len(messages):
                         user_state["status"] = f"Waiting for next msg ⏳"
-                        user_state["next_msg_at"] = datetime.now() + timedelta(minutes=user_state["cycle"])
+                        now = _get_now_tz(tz)
+                        user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
                         await asyncio.sleep(user_state["cycle"] * 60)
 
                 # After all messages are processed, wait the cycle delay again before checking for new messages
                 user_state["status"] = "Idle 😴"
-                user_state["next_msg_at"] = datetime.now() + timedelta(minutes=user_state["cycle"])
+                now = _get_now_tz(tz)
+                user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
                 await asyncio.sleep(user_state["cycle"] * 60)
 
             except Exception as e:
@@ -583,6 +629,7 @@ async def run_user_bot(config):
         log_event(f"Bot for {phone} stopped.")
 
 async def user_loader():
+    config_mtimes = {} # path -> last_mtime
     while True:
         if not os.path.exists(USERS_DIR):
             os.makedirs(USERS_DIR, exist_ok=True)
@@ -591,13 +638,18 @@ async def user_loader():
             if file.endswith(".json"):
                 path = os.path.join(USERS_DIR, file)
                 try:
-                    with open(path, 'r', encoding="utf-8") as f:
-                        config = json.load(f)
-                        asyncio.create_task(run_user_bot(config))
-
+                    mtime = os.path.getmtime(path)
+                    # Only load if new or modified
+                    if path not in config_mtimes or mtime > config_mtimes[path]:
+                        with open(path, 'r', encoding="utf-8") as f:
+                            config = json.load(f)
+                            phone = config.get("phone")
+                            if phone and phone not in started_phones:
+                                asyncio.create_task(run_user_bot(config))
+                                config_mtimes[path] = mtime
                 except Exception as e:
                     logger.error(f"Error loading user config {file}: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(30) # Check every 30s for changes
 
 async def main():
     os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -612,10 +664,25 @@ async def main():
     # Ensure Auto-Night config file exists
     if not os.path.exists(AUTONIGHT_PATH):
         _save_autonight(AUTONIGHT_CFG)
-    await user_loader()
+    
+    # Setup signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    def stop_all():
+        logger.info("Shutdown signal received. Stopping...")
+        for task in asyncio.all_tasks():
+            task.cancel()
+
+    if os.name != 'nt': # Signals not fully supported on Windows this way
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_all)
+    
+    try:
+        await user_loader()
+    except asyncio.CancelledError:
+        pass
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown requested. Exiting.")
