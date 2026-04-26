@@ -1,12 +1,13 @@
 import asyncio
 import random
 import os
-from datetime import datetime, timedelta
+import json
+from datetime import datetime, timedelta, time
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, SlowModeWaitError, ChatWriteForbiddenError
 from sqlalchemy.orm import Session
-from backend.database.db import SessionLocal, Account, Group, Stats
+from backend.database.db import SessionLocal, Account, Group, Stats, GlobalConfig
 
 class ForwardingEngine:
     def __init__(self, account_id: int):
@@ -95,14 +96,38 @@ class ForwardingEngine:
         await self.auto_delete(event, res)
 
     async def auto_delete(self, event, response, delay=50):
-        """Wait for delay and then delete the command and response."""
         await asyncio.sleep(delay)
-        try:
-            await event.delete()
+        try: await event.delete()
         except: pass
-        try:
-            await response.delete()
+        try: await response.delete()
         except: pass
+
+    async def is_night_mode(self, db):
+        # Default Auto-Night config
+        config_entry = db.query(GlobalConfig).filter(GlobalConfig.key == "autonight").first()
+        if not config_entry:
+            return False
+        
+        cfg = json.loads(config_entry.value)
+        if not cfg.get("enabled", True):
+            return False
+            
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(cfg.get("tz", "Asia/Kolkata"))).time()
+        except:
+            now = datetime.now().time()
+            
+        start_h, start_m = map(int, cfg.get("start", "00:00").split(":"))
+        end_h, end_m = map(int, cfg.get("end", "06:00").split(":"))
+        
+        start_t = time(start_h, start_m)
+        end_t = time(end_h, end_m)
+        
+        if start_t <= end_t:
+            return start_t <= now <= end_t
+        else: # Midnight wrap
+            return now >= start_t or now <= end_t
 
     async def forward_loop(self):
         while self.is_running:
@@ -110,14 +135,20 @@ class ForwardingEngine:
             try:
                 acc = db.query(Account).filter(Account.id == self.account_id).first()
                 stats = db.query(Stats).filter(Stats.account_id == self.account_id).first()
-                groups = [g.url for g in acc.groups]
 
+                # 🌙 Check Auto-Night
+                if await self.is_night_mode(db):
+                    self.update_status(db, stats, "Night Mode 🌙")
+                    db.close()
+                    await asyncio.sleep(60)
+                    continue
+
+                groups = [g.url for g in acc.groups]
                 if not groups:
                     self.update_status(db, stats, "No groups")
                     await asyncio.sleep(60)
                     continue
 
-                # Fetch latest message
                 messages = await self.client.get_messages("me", limit=1)
                 if not messages:
                     self.update_status(db, stats, "Waiting for message in Saved")
@@ -130,6 +161,9 @@ class ForwardingEngine:
                 db.commit()
 
                 for i, group in enumerate(groups):
+                    # Check night mode mid-cycle
+                    if await self.is_night_mode(db): break
+
                     self.update_status(db, stats, f"Forwarding ({i+1}/{len(groups)})")
                     try:
                         if acc.use_copy:
@@ -147,7 +181,6 @@ class ForwardingEngine:
                         self.log_event(f"FloodWait! Sleeping {e.seconds}s", "warning")
                         self.update_status(db, stats, f"FloodWait ({e.seconds}s)")
                         await asyncio.sleep(e.seconds + 5)
-                        # We don't increment fail here because we want to retry or just continue
                     except SlowModeWaitError as e:
                         self.log_event(f"SlowMode in {group}. Waiting {e.seconds}s", "warning")
                         await asyncio.sleep(e.seconds)
@@ -160,13 +193,11 @@ class ForwardingEngine:
                         stats.current_cycle_fail += 1
                         self.log_event(f"Failed {group}: {type(e).__name__}", "warning")
 
-                    # Delay between groups (skipped if we already slept for Flood/Slowmode)
                     delay = acc.msg_delay_sec * random.uniform(0.8, 1.2)
                     stats.next_msg_at = datetime.now() + timedelta(seconds=delay)
                     db.commit()
                     await asyncio.sleep(delay)
 
-                # Cycle complete
                 stats.last_cycle_at = datetime.now()
                 self.update_status(db, stats, "Cycle Waiting")
                 cycle_delay = acc.cycle_delay_min * 60
@@ -178,7 +209,7 @@ class ForwardingEngine:
                 self.log_event(f"Loop error: {str(e)}", "error")
                 await asyncio.sleep(60)
             finally:
-                db.close()
+                if db: db.close()
 
     def update_status(self, db, stats, status_msg):
         stats.status = status_msg

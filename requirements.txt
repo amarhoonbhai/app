@@ -3,4 +3,3 @@ colorama==0.4.6
 sqlalchemy==2.0.28
 loguru==0.7.2
 pydantic==2.6.4
-rich==13.7.1
