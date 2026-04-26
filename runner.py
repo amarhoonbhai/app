@@ -239,24 +239,40 @@ async def run_user_bot(config):
         await client.connect()
         if not await client.is_user_authorized():
             logger.error(f"[{phone}] Session revoked or unauthorized.")
-            started_phones.remove(phone)
             return
+
+        me = await client.get_me()
+        me_id = me.id
+        log_event(f"Bot connected: {config.get('name','N/A')} (ID: {me_id})")
     except Exception as e:
         logger.error(f"[{phone}] Connection failure: {e}")
-        started_phones.remove(phone)
         return
 
-    log_event(f"Started bot for {config.get('name','N/A')}")
 
+    async def delayed_delete(chat_id, msg_ids, delay=40):
+        await asyncio.sleep(delay)
+        try:
+            await client.delete_messages(chat_id, msg_ids)
+        except Exception:
+            pass
 
-    @client.on(events.NewMessage)
+    @client.on(events.NewMessage(outgoing=True))
     async def command_handler(event):
-        """Accept commands only from the account owner (self)."""
-        me = await client.get_me()
-        if event.sender_id != me.id:
+        text = (event.raw_text or "").strip()
+        if not text.startswith("."):
             return
 
-        text = (event.raw_text or "").strip()
+        # Setup auto-delete for command and its responses
+        orig_respond = event.respond
+        async def auto_delete_respond(*args, **kwargs):
+            resp = await orig_respond(*args, **kwargs)
+            if resp:
+                asyncio.create_task(delayed_delete(event.chat_id, [event.id, resp.id]))
+            return resp
+        event.respond = auto_delete_respond
+
+        # Ensure command itself is deleted after 40s even if no respond() is called
+        asyncio.create_task(delayed_delete(event.chat_id, [event.id]))
 
         if text.startswith(".time"):
             value = int(''.join(filter(str.isdigit, text)) or "0")
@@ -525,7 +541,14 @@ async def run_user_bot(config):
                 await asyncio.sleep(60)
 
     asyncio.create_task(forward_loop())
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"[{phone}] Disconnected with error: {e}")
+    finally:
+        if phone in started_phones:
+            started_phones.remove(phone)
+        log_event(f"Bot for {phone} stopped.")
 
 async def user_loader():
     while True:

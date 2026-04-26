@@ -87,11 +87,12 @@ def list_users(users: Dict[str, Any]) -> None:
 def is_runner_running() -> bool:
     try:
         if os.name == 'nt':
-            # Windows: Check if runner.py is in the command line of any process
+            # Windows: Check if runner.py is in the command line, excluding the current check process
             try:
-                cmd = 'powershell "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*runner.py*\' }"'
-                output = subprocess.check_output(cmd, shell=True).decode('cp1252', 'ignore')
-                return "runner.py" in output
+                # We look for 'python' and 'runner.py' in the command line, but exclude 'powershell' which is likely this check
+                cmd = 'powershell "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*runner.py*\' -and $_.Name -ne \'powershell.exe\' -and $_.Name -ne \'cmd.exe\' } | Select-Object -Property ProcessId"'
+                output = subprocess.check_output(cmd, shell=True).decode('cp1252', 'ignore').strip()
+                return len(output) > 0
             except:
                 return False
         else:
