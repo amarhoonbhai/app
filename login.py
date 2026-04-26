@@ -87,26 +87,56 @@ def add_account():
 
     os.makedirs("sessions", exist_ok=True)
     session_path = os.path.join("sessions", f"{phone}")
+    
+    # We create a fresh client
     client = TelegramClient(session_path, int(api_id), api_hash)
     
     try:
-        # Use client.start() for a much more robust interactive login (handles OTP/2FA automatically)
-        client.start(phone=phone)
+        print(Fore.YELLOW + "  [~] Connecting to Telegram...")
+        client.connect()
+        
+        if not client.is_user_authorized():
+            print(Fore.YELLOW + f"  [~] Requesting OTP for {phone}...")
+            try:
+                # Explicitly request the code
+                client.send_code_request(phone)
+                print(Fore.GREEN + "  [✔] Code sent! Please check your Telegram app or SMS.")
+            except FloodWaitError as e:
+                print(Fore.RED + f"  [!] Flood Wait: Must wait {e.seconds}s before requesting again.")
+                input()
+                return
+            except Exception as e:
+                print(Fore.RED + f"  [!] Failed to send code: {e}")
+                input()
+                return
+
+            code = input(Fore.YELLOW + "  ❯ Enter the Code: ").strip()
+            try:
+                client.sign_in(phone, code)
+            except SessionPasswordNeededError:
+                pw = input(Fore.YELLOW + "  ❯ 2FA Password Required: ").strip()
+                client.sign_in(password=pw)
         
         me = client.get_me()
         user_display = (getattr(me, "first_name", "") or getattr(me, "username", "") or str(me.id))
-        print(Fore.GREEN + f"  [✔] Logged in as: {user_display}")
+        print(Fore.GREEN + f"  [✔] Successfully logged in as: {user_display}")
         
         db = SessionLocal()
-        acc = Account(phone=phone, name=name or user_display, api_id=int(api_id), api_hash=api_hash)
-        db.add(acc)
-        db.flush()
-        db.add(Stats(account_id=acc.id))
-        db.commit()
+        # Check if already exists to avoid duplicates
+        existing = db.query(Account).filter(Account.phone == phone).first()
+        if not existing:
+            acc = Account(phone=phone, name=name or user_display, api_id=int(api_id), api_hash=api_hash)
+            db.add(acc)
+            db.flush()
+            db.add(Stats(account_id=acc.id))
+            db.commit()
+            print(Fore.GREEN + "  [✔] Account saved to database.")
+        else:
+            print(Fore.YELLOW + "  [!] Account already exists in database. Session updated.")
         db.close()
         
     except Exception as e:
-        print(Fore.RED + f"  [!] Login failed: {e}")
+        print(Fore.RED + f"  [!] Login Error: {e}")
     finally:
         client.disconnect()
     input("\n  Press Enter...")
