@@ -22,6 +22,9 @@ from telethon.errors import (
     SlowModeWaitError
 )
 import telethon.utils as tel_utils
+from colorama import Fore, Style, init
+
+init(autoreset=True)
 
 
 # =========================
@@ -229,6 +232,25 @@ async def run_user_bot(config):
 
     def log_event(msg):
         ts = datetime.now().strftime("%H:%M:%S")
+        
+        # Determine color and icon
+        color = Fore.WHITE
+        icon = "ℹ"
+        
+        lower_msg = msg.lower()
+        if "success" in lower_msg:
+            color = Fore.GREEN
+            icon = "✔"
+        elif "failed" in lower_msg or "error" in lower_msg or "floodwait" in lower_msg:
+            color = Fore.RED
+            icon = "✖"
+        elif "processing" in lower_msg:
+            color = Fore.CYAN
+            icon = "📡"
+        
+        clean_msg = msg.replace("**", "") # Remove markdown for console
+        print(f"{Fore.MAGENTA}[{ts}] {color}{icon} {Fore.WHITE}{clean_msg}")
+        
         user_state["logs"].append(f"[{ts}] {msg}")
         if len(user_state["logs"]) > 10:
             user_state["logs"].pop(0)
@@ -580,6 +602,13 @@ async def user_loader():
 async def main():
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     os.makedirs(USERS_DIR, exist_ok=True)
+    
+    print(f"{Fore.CYAN}{Style.BRIGHT}╔════════════════════════════════════════════╗")
+    print(f"{Fore.CYAN}║    {Fore.YELLOW}KURUP ADS V5 ELITE - WORKER ENGINE      {Fore.CYAN}║")
+    print(f"{Fore.CYAN}║    {Fore.GREEN}Status: Operational                     {Fore.CYAN}║")
+    print(f"{Fore.CYAN}╚════════════════════════════════════════════╝{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}Logs will appear below in real-time...\n")
+
     # Ensure Auto-Night config file exists
     if not os.path.exists(AUTONIGHT_PATH):
         _save_autonight(AUTONIGHT_CFG)

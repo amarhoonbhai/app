@@ -111,14 +111,26 @@ def start_runner_if_needed():
         return
     
     python_cmd = "python" if os.name == "nt" else "python3"
-    with open(RUNNER_LOG, "ab") as logf:
-        subprocess.Popen(
-            [python_cmd, "runner.py"],
-            stdout=logf,
-            stderr=logf,
-            start_new_session=(os.name != "nt") # start_new_session is for Unix
-        )
-    print(Fore.CYAN + f"  [🔁] Background engine started successfully.")
+    if os.name == "nt":
+        # Windows: Start in a new console window so logs are visible
+        try:
+            subprocess.Popen(
+                [python_cmd, "runner.py"],
+                creationflags=subprocess.CREATE_NEW_CONSOLE
+            )
+            print(Fore.CYAN + f"  [🔁] Background engine started in a NEW window.")
+        except Exception as e:
+            print(Fore.RED + f"  [!] Failed to start engine: {e}")
+    else:
+        # Linux: Start in background with log file
+        with open(RUNNER_LOG, "ab") as logf:
+            subprocess.Popen(
+                [python_cmd, "runner.py"],
+                stdout=logf,
+                stderr=logf,
+                start_new_session=True
+            )
+        print(Fore.CYAN + f"  [🔁] Background engine started successfully.")
 
 
 # ---------- Auto-Night editor ----------
