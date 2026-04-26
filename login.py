@@ -109,7 +109,7 @@ def add_account():
                 sent_code = client.send_code_request(phone)
                 
                 # Identify where the code was sent
-                from telethon.tl.types import SentCodeTypeApp, SentCodeTypeSms
+                from telethon.tl.types.auth import SentCodeTypeApp, SentCodeTypeSms
                 where = "Telegram App" if isinstance(sent_code.type, SentCodeTypeApp) else "SMS"
                 
                 print(Fore.GREEN + f"  [✔] Code sent via {where}!")
