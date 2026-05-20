@@ -173,7 +173,8 @@ def start_runner_if_needed():
         except Exception:
             pass
 
-    python_cmd = "python" if os.name == "nt" else "python3"
+    import sys
+    python_cmd = sys.executable
     if os.name == "nt":
         # Windows: Start in a new console window so logs are visible
         try:

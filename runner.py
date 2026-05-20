@@ -350,32 +350,33 @@ async def run_user_bot(config):
         if text.startswith(".time"):
             value = int(''.join(filter(str.isdigit, text)) or "0")
             if value <= 0:
-                await event.respond("❗ Usage: `.time 20m` or `.time 1h`")
+                await event.respond("❗ Usage: `.time 7m` or `.time 1h`")
                 return
             if 'h' in text.lower():
                 value = value * 60
             
-            if value < 20:
-                await event.respond("⚠️ Minimum cycle interval is **20 minutes**. Setting to 20m.")
-                value = 20
+            if value < 5:
+                await event.respond("⚠️ Minimum cycle interval is **5 minutes**. Setting to 5m.")
+                value = 5
                 
             user_state["cycle"] = value
             config["cycle_delay_min"] = value
             atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
             
             tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
-            user_state["next_msg_at"] = _get_now_tz(tz) + timedelta(minutes=value)
+            sleep_seconds = _get_cycle_seconds_with_jitter(value)
+            user_state["next_msg_at"] = _get_now_tz(tz) + timedelta(seconds=sleep_seconds)
             await event.respond(f"✅ Cycle delay set to **{value} minutes**")
 
         elif text.startswith(".delay"):
             value = int(''.join(filter(str.isdigit, text)) or "0")
             if value <= 0:
-                await event.respond("❗ Usage: `.delay 20` (seconds)")
+                await event.respond("❗ Usage: `.delay 30` (seconds)")
                 return
             
-            if value < 20:
-                await event.respond("⚠️ Minimum message delay is **20 seconds**. Setting to 20s.")
-                value = 20
+            if value < 10:
+                await event.respond("⚠️ Minimum message delay is **10 seconds**. Setting to 10s.")
+                value = 10
                 
             user_state["delay"] = value
             config["msg_delay_sec"] = value
@@ -383,7 +384,7 @@ async def run_user_bot(config):
             
             tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
             user_state["next_msg_at"] = _get_now_tz(tz) + timedelta(seconds=value)
-            await event.respond(f"✅ Message delay set to **{value} seconds** (Randomized ±10%)")
+            await event.respond(f"✅ Message delay set to **{value} seconds** (Randomized ±15%)")
 
 
         elif text.startswith(".status"):
@@ -468,21 +469,54 @@ async def run_user_bot(config):
             await event.respond("\n".join(msg) or "No changes.")
 
         elif text.startswith(".delgroup"):
-            parts = text.split()
+            links = re.findall(r'https://t\.me/\S+', text)
+            if not links:
+                await event.respond("⚠️ Usage: `.delgroup <link1> <link2> ...`")
+                return
+            removed, skipped = [], []
             groups_list = config.setdefault("groups", [])
-            if len(parts) == 2 and parts[1] in groups_list:
-                groups_list.remove(parts[1])
-                atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
-                await event.respond("❀ Group removed.")
-            else:
-                await event.respond("❗ Usage: `.delgroup <https://t.me/...>` (must match an existing group)")
+            for link in links:
+                normalized_link = link.rstrip('/')
+                found = None
+                for g in groups_list:
+                    if g.rstrip('/') == normalized_link:
+                        found = g
+                        break
+                if found:
+                    groups_list.remove(found)
+                    removed.append(link)
+                else:
+                    skipped.append(link)
+            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            msg = []
+            if removed:
+                msg.append(f"✅ Removed **{len(removed)}** group(s).")
+            if skipped:
+                msg.append(f"⚠️ Skipped **{len(skipped)}** group(s) (not in list).")
+            await event.respond("\n".join(msg) or "No changes.")
 
         elif text.startswith(".groups"):
             groups_list = config.setdefault("groups", [])
-            if groups_list:
-                await event.respond("❀ Groups:\n" + "\n".join([g for g in groups_list if "t.me" in g]))
-            else:
+            if not groups_list:
                 await event.respond("📋 No groups configured.")
+            else:
+                lines = [f"❀ Groups ({len(groups_list)}):"]
+                for idx, g in enumerate(groups_list, 1):
+                    lines.append(f"{idx}. {g}")
+                
+                # Chunk sending to avoid Telegram MessageTooLongError
+                current_chunk = []
+                current_len = 0
+                for line in lines:
+                    if current_len + len(line) + 1 > 4000:
+                        await event.respond("\n".join(current_chunk))
+                        current_chunk = [line]
+                        current_len = len(line)
+                    else:
+                        current_chunk.append(line)
+                        current_len += len(line) + 1
+                if current_chunk:
+                    await event.respond("\n".join(current_chunk))
 
         elif text.startswith(".night"):
             # .night, .night on/off, .night 23:00 to 07:00
@@ -512,17 +546,22 @@ async def run_user_bot(config):
             success, fail = 0, 0
             for link in links:
                 try:
-                    # Handle both private and public links
-                    if "t.me/+" in link or "t.me/joinchat/" in link:
+                    clean_link = link.strip().rstrip('/')
+                    # Handle both private and public invite links robustly
+                    if "t.me/+" in clean_link:
+                        hash_val = clean_link.split('+')[-1]
                         from telethon.tl.functions.messages import ImportChatInviteRequest
-                        hash = link.split('/')[-1]
-                        await client(ImportChatInviteRequest(hash))
+                        await client(ImportChatInviteRequest(hash_val))
+                    elif "t.me/joinchat/" in clean_link:
+                        hash_val = clean_link.split('joinchat/')[-1]
+                        from telethon.tl.functions.messages import ImportChatInviteRequest
+                        await client(ImportChatInviteRequest(hash_val))
                     else:
+                        username = clean_link.split('/')[-1]
                         from telethon.tl.functions.channels import JoinChannelRequest
-                        username = link.split('/')[-1]
                         await client(JoinChannelRequest(username))
                     success += 1
-                    await asyncio.sleep(random.randint(10, 20)) # Wait between joins
+                    await asyncio.sleep(random.randint(10, 20)) # Wait between joins to prevent flood
                 except Exception as e:
                     logger.error(f"Join error {link}: {e}")
                     fail += 1
