@@ -552,12 +552,25 @@ async def run_user_bot(config):
                     else:
                         break # safety break
                 
+                # 🎯 Check if target groups are configured first
+                groups_list = config.setdefault("groups", [])
+                if not groups_list:
+                    log_event("No target groups configured.")
+                    user_state["status"] = "Idle (No Groups) 😴"
+                    now = _get_now_tz(tz)
+                    user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
+                    await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                    continue
+
                 # 💎 Fetch all messages from Saved Messages (up to 100)
                 user_state["status"] = "Fetching Msgs 🔍"
                 messages = await client.get_messages("me", limit=100)
                 
-                if not messages:
-                    log_event("No messages in Saved Messages.")
+                # Filter out messages that cannot be sent (empty text & no media)
+                valid_messages = [m for m in messages if m.text or m.media]
+
+                if not valid_messages:
+                    log_event("No valid messages in Saved Messages.")
                     user_state["status"] = "Idle (No Msg) 😴"
                     now = _get_now_tz(tz)
                     user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
@@ -565,8 +578,8 @@ async def run_user_bot(config):
                     continue
 
                 # Forward messages one by one
-                for msg_idx, msg in enumerate(messages, 1):
-                    log_event(f"Processing message {msg_idx}/{len(messages)}")
+                for msg_idx, msg in enumerate(valid_messages, 1):
+                    log_event(f"Processing message {msg_idx}/{len(valid_messages)}")
                     interrupted_by_night = False
                     
                     user_state["current_cycle_success"] = 0
@@ -580,6 +593,9 @@ async def run_user_bot(config):
                             break
 
                         user_state["status"] = f"Msg {msg_idx} -> Grp {i}/{len(groups_list)} 📡"
+                        send_start = _get_now_tz(tz)
+                        custom_sleep_done = False
+                        
                         try:
                             if user_state["use_copy"]:
                                 # 🌈 Copy Mode
@@ -595,15 +611,6 @@ async def run_user_bot(config):
                             user_state["success_total"] += 1
                             user_state["current_cycle_success"] += 1
                             log_event(f"Msg {msg_idx} Success -> {group}")
-                            
-                            # ⚡ 20 sec group gap (randomized ±10%)
-                            if i < len(groups_list):
-                                wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
-                                now = _get_now_tz(tz)
-                                user_state["next_msg_at"] = now + timedelta(seconds=wait_time)
-                                await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
-                            else:
-                                user_state["next_msg_at"] = None
 
                         except FloodWaitError as e:
                              log_event(f"FloodWait! Sleeping {e.seconds}s. Increasing delay.")
@@ -614,12 +621,14 @@ async def run_user_bot(config):
                              now = _get_now_tz(tz)
                              user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 5)
                              await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                             custom_sleep_done = True
                         except SlowModeWaitError as e:
                              log_event(f"Slowmode in {group}. Waiting {e.seconds}s")
                              user_state["status"] = f"Slowmode ⏳ ({e.seconds}s)"
                              now = _get_now_tz(tz)
                              user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 2)
                              await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                             custom_sleep_done = True
                         except ChatWriteForbiddenError:
                             log_event(f"No permission in {group}")
                             user_state["fail_total"] += 1
@@ -628,6 +637,19 @@ async def run_user_bot(config):
                             log_event(f"Failed {group}: {type(e).__name__}")
                             user_state["fail_total"] += 1
                             user_state["current_cycle_fail"] += 1
+
+                        # Always sleep the delay between groups (unless custom sleep occurred or it is the last group)
+                        if i < len(groups_list) and not custom_sleep_done:
+                            wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
+                            # Subtract the message-sending duration to avoid latency drift accumulation
+                            elapsed = (_get_now_tz(tz) - send_start).total_seconds()
+                            remaining_wait = max(0.1, wait_time - elapsed)
+                            
+                            now = _get_now_tz(tz)
+                            user_state["next_msg_at"] = now + timedelta(seconds=remaining_wait)
+                            await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                        elif i == len(groups_list):
+                            user_state["next_msg_at"] = None
 
                     if interrupted_by_night:
                         break # exit message loop and go back to outer while True
@@ -642,7 +664,7 @@ async def run_user_bot(config):
                     log_event(f"Msg {msg_idx} cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
                     
                     # Interval delay between different messages
-                    if msg_idx < len(messages):
+                    if msg_idx < len(valid_messages):
                         user_state["status"] = f"Waiting for next msg ⏳"
                         now = _get_now_tz(tz)
                         user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
@@ -653,6 +675,7 @@ async def run_user_bot(config):
                 now = _get_now_tz(tz)
                 user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
                 await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+
             except Exception as e:
                 log_event(f"Error in forward loop: {e}")
                 await asyncio.sleep(60)
