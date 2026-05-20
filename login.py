@@ -79,7 +79,7 @@ def save_user_config(phone: str, data: Dict[str, Any]) -> None:
         "api_id": int(data["api_id"]),
         "api_hash": data["api_hash"],
         "cycle_delay_min": 20,
-        "msg_delay_sec": 300,
+        "msg_delay_sec": 30,
         "groups": [],
 
         "plan_expiry": "Lifetime"
@@ -103,31 +103,76 @@ def list_users(users: Dict[str, Any]) -> None:
 
 # ---------- Runner management ----------
 def is_runner_running() -> bool:
+    pid_file = "runner.pid"
+    if not os.path.exists(pid_file):
+        return False
     try:
-        if os.name == 'nt':
-            # Windows: More robust check using tasklist
-            cmd = 'tasklist /FI "IMAGENAME eq python.exe" /FO CSV'
-            output = subprocess.check_output(cmd, shell=True).decode('cp1252', 'ignore')
-            # Check if any python process has 'runner.py' in its command line is hard with tasklist,
-            # but we can try wmic or just stick to the previous one with a fix.
-            cmd = 'powershell "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*runner.py*\' } | Select-Object -Property ProcessId"'
-            output = subprocess.check_output(cmd, shell=True).decode('cp1252', 'ignore').strip()
-            return len(output) > 0
-        else:
-            # Linux: Check pgrep
-            out = subprocess.run(
-                ["pgrep", "-af", "runner.py"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-            )
-            return bool(out.stdout.strip())
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
     except Exception:
         return False
+
+    if pid <= 0:
+        return False
+
+    if os.name == 'nt':
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            err = ctypes.windll.kernel32.GetLastError()
+            return err == 5
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+def stop_runner():
+    pid_file = "runner.pid"
+    if not os.path.exists(pid_file):
+        print(Fore.YELLOW + "  [!] No PID file found. Engine might not be running.")
+        return
+    try:
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+    except Exception:
+        print(Fore.RED + "  [!] Failed to read PID file.")
+        return
+
+    print(Fore.YELLOW + f"  [🔁] Stopping background engine (PID: {pid})...")
+    try:
+        if os.name == 'nt':
+            subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            import signal
+            os.kill(pid, signal.SIGTERM)
+    except Exception as e:
+        print(Fore.RED + f"  [!] Failed to stop engine: {e}")
+    finally:
+        try:
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+        except Exception:
+            pass
 
 def start_runner_if_needed():
     if is_runner_running():
         print(Fore.GREEN + "  [✔] Background engine is already running.")
         return
     
+    # Remove stale pid file if exists
+    if os.path.exists("runner.pid"):
+        try:
+            os.remove("runner.pid")
+        except Exception:
+            pass
+
     python_cmd = "python" if os.name == "nt" else "python3"
     if os.name == "nt":
         # Windows: Start in a new console window so logs are visible
@@ -341,6 +386,9 @@ def start():
         elif choice == '5':
             edit_autonight()
         elif choice == '6':
+            stop_runner()
+            import time as pytime
+            pytime.sleep(1.5)
             start_runner_if_needed()
         elif choice == '7':
             check_account_health(users)

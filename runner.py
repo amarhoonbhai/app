@@ -216,6 +216,21 @@ USERS_DIR = "users"
 SESSIONS_DIR = "sessions"
 clients = {}
 started_phones = set()
+active_bots = {}
+
+async def interruptible_sleep(get_target_time, tz_name: str):
+    while True:
+        target = get_target_time()
+        if not target:
+            break
+        now = _get_now_tz(tz_name)
+        if now >= target:
+            break
+        rem = (target - now).total_seconds()
+        if rem <= 0:
+            break
+        # Sleep at most 1 second to remain highly responsive
+        await asyncio.sleep(min(rem, 1.0))
 
 # Global Auto-Night config (shared across accounts)
 AUTONIGHT_CFG = _load_autonight()
@@ -231,7 +246,6 @@ async def run_user_bot(config):
     session_path = os.path.join(SESSIONS_DIR, f"{phone}.session")
     api_id = int(config["api_id"])
     api_hash = config["api_hash"]
-    groups = config.get("groups", [])
     delay = config.get("msg_delay_sec", 20)
     cycle = config.get("cycle_delay_min", 20)
 
@@ -247,6 +261,12 @@ async def run_user_bot(config):
         "status": "Idle 😴",
         "logs": [],
         "start_time": _get_now_tz(AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"]))
+    }
+
+    active_bots[phone] = {
+        "client": None,
+        "state": user_state,
+        "config": config
     }
 
     def log_event(msg):
@@ -278,6 +298,7 @@ async def run_user_bot(config):
         logger.info(f"[{phone}] {msg}")
 
     client = TelegramClient(session_path, api_id, api_hash)
+    active_bots[phone]["client"] = client
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -330,7 +351,12 @@ async def run_user_bot(config):
                 value = 20
                 
             user_state["cycle"] = value
-            await event.respond(f"✅ Cycle delay set to **{user_state['cycle']} minutes**")
+            config["cycle_delay_min"] = value
+            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            
+            tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+            user_state["next_msg_at"] = _get_now_tz(tz) + timedelta(minutes=value)
+            await event.respond(f"✅ Cycle delay set to **{value} minutes**")
 
         elif text.startswith(".delay"):
             value = int(''.join(filter(str.isdigit, text)) or "0")
@@ -343,6 +369,11 @@ async def run_user_bot(config):
                 value = 20
                 
             user_state["delay"] = value
+            config["msg_delay_sec"] = value
+            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            
+            tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+            user_state["next_msg_at"] = _get_now_tz(tz) + timedelta(seconds=value)
             await event.respond(f"✅ Message delay set to **{value} seconds** (Randomized ±10%)")
 
 
@@ -381,7 +412,7 @@ async def run_user_bot(config):
                 f"👤 **Account:** {config.get('name')} ({phone})\n"
                 f"⏱ **Uptime:** `{uptime}`\n"
                 f"🔄 **Status:** {user_state['status']}\n"
-                f"📍 **Groups:** {len(groups)}\n"
+                f"📍 **Groups:** {len(config.setdefault('groups', []))}\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"✅ **Total Success:** `{user_state['success_total']}`\n"
                 f"❌ **Total Failed:** `{user_state['fail_total']}`\n"
@@ -399,7 +430,7 @@ async def run_user_bot(config):
                 f"❀ Name: {config.get('name')}\n"
                 f"❀ Cycle Delay: {user_state['cycle']} min\n"
                 f"❀ Message Delay: {user_state['delay']} sec\n"
-                f"❀ Groups: {len(groups)}\n"
+                f"❀ Groups: {len(config.setdefault('groups', []))}\n"
                 f"❀ Plan Access: {expiry}\n\n"
                 + autonight_status_text(AUTONIGHT_CFG)
             )
@@ -412,15 +443,14 @@ async def run_user_bot(config):
                 await event.respond("⚠️ No valid group links found.")
                 return
             added, skipped = [], []
+            groups_list = config.setdefault("groups", [])
             for link in links:
-                if link not in groups:
-                    groups.append(link)
+                if link not in groups_list:
+                    groups_list.append(link)
                     added.append(link)
                 else:
                     skipped.append(link)
-            config["groups"] = groups
-            with open(os.path.join(USERS_DIR, f"{phone}.json"), "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
+            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
             msg = []
             if added:
                 msg.append(f"✅ Added **{len(added)}** new group(s).")
@@ -430,18 +460,18 @@ async def run_user_bot(config):
 
         elif text.startswith(".delgroup"):
             parts = text.split()
-            if len(parts) == 2 and parts[1] in groups:
-                groups.remove(parts[1])
-                config["groups"] = groups
-                with open(os.path.join(USERS_DIR, f"{phone}.json"), "w", encoding="utf-8") as f:
-                    json.dump(config, f, ensure_ascii=False, indent=2)
+            groups_list = config.setdefault("groups", [])
+            if len(parts) == 2 and parts[1] in groups_list:
+                groups_list.remove(parts[1])
+                atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
                 await event.respond("❀ Group removed.")
             else:
                 await event.respond("❗ Usage: `.delgroup <https://t.me/...>` (must match an existing group)")
 
         elif text.startswith(".groups"):
-            if groups:
-                await event.respond("❀ Groups:\n" + "\n".join([g for g in groups if "t.me" in g]))
+            groups_list = config.setdefault("groups", [])
+            if groups_list:
+                await event.respond("❀ Groups:\n" + "\n".join([g for g in groups_list if "t.me" in g]))
             else:
                 await event.respond("📋 No groups configured.")
 
@@ -507,11 +537,9 @@ async def run_user_bot(config):
                 "• `.status` | `.info` | `.night`"
             )
 
-
-
     async def forward_loop():
-        tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
         while True:
+            tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
             try:
                 # 🌙 If within quiet hours, check every minute if still quiet
                 while autonight_is_quiet(AUTONIGHT_CFG):
@@ -533,7 +561,7 @@ async def run_user_bot(config):
                     user_state["status"] = "Idle (No Msg) 😴"
                     now = _get_now_tz(tz)
                     user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
-                    await asyncio.sleep(user_state["cycle"] * 60)
+                    await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
                     continue
 
                 # Forward messages one by one
@@ -544,13 +572,14 @@ async def run_user_bot(config):
                     user_state["current_cycle_success"] = 0
                     user_state["current_cycle_fail"] = 0
 
-                    for i, group in enumerate(groups, 1):
+                    groups_list = config.setdefault("groups", [])
+                    for i, group in enumerate(groups_list, 1):
                         # If night starts mid-cycle, break early
                         if autonight_is_quiet(AUTONIGHT_CFG):
                             interrupted_by_night = True
                             break
 
-                        user_state["status"] = f"Msg {msg_idx} -> Grp {i}/{len(groups)} 📡"
+                        user_state["status"] = f"Msg {msg_idx} -> Grp {i}/{len(groups_list)} 📡"
                         try:
                             if user_state["use_copy"]:
                                 # 🌈 Copy Mode
@@ -568,20 +597,29 @@ async def run_user_bot(config):
                             log_event(f"Msg {msg_idx} Success -> {group}")
                             
                             # ⚡ 20 sec group gap (randomized ±10%)
-                            wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
-                            now = _get_now_tz(tz)
-                            user_state["next_msg_at"] = now + timedelta(seconds=wait_time)
-                            await asyncio.sleep(wait_time)
+                            if i < len(groups_list):
+                                wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
+                                now = _get_now_tz(tz)
+                                user_state["next_msg_at"] = now + timedelta(seconds=wait_time)
+                                await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                            else:
+                                user_state["next_msg_at"] = None
 
                         except FloodWaitError as e:
-                            log_event(f"FloodWait! Sleeping {e.seconds}s. Increasing delay.")
-                            user_state["status"] = f"FloodWait ⏳ ({e.seconds}s)"
-                            # Safer: increase delay for future messages
-                            user_state["delay"] = min(user_state["delay"] + 20, 600)
-                            await asyncio.sleep(e.seconds + 5)
+                             log_event(f"FloodWait! Sleeping {e.seconds}s. Increasing delay.")
+                             user_state["status"] = f"FloodWait ⏳ ({e.seconds}s)"
+                             user_state["delay"] = min(user_state["delay"] + 20, 600)
+                             config["msg_delay_sec"] = user_state["delay"]
+                             atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+                             now = _get_now_tz(tz)
+                             user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 5)
+                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
                         except SlowModeWaitError as e:
-                            log_event(f"Slowmode in {group}. Waiting {e.seconds}s")
-                            await asyncio.sleep(e.seconds + 2)
+                             log_event(f"Slowmode in {group}. Waiting {e.seconds}s")
+                             user_state["status"] = f"Slowmode ⏳ ({e.seconds}s)"
+                             now = _get_now_tz(tz)
+                             user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 2)
+                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
                         except ChatWriteForbiddenError:
                             log_event(f"No permission in {group}")
                             user_state["fail_total"] += 1
@@ -598,6 +636,8 @@ async def run_user_bot(config):
                     if user_state["current_cycle_fail"] == 0 and user_state["current_cycle_success"] > 0:
                         if user_state["delay"] > 25:
                             user_state["delay"] -= 2
+                            config["msg_delay_sec"] = user_state["delay"]
+                            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
 
                     log_event(f"Msg {msg_idx} cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
                     
@@ -606,17 +646,17 @@ async def run_user_bot(config):
                         user_state["status"] = f"Waiting for next msg ⏳"
                         now = _get_now_tz(tz)
                         user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
-                        await asyncio.sleep(user_state["cycle"] * 60)
+                        await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
 
                 # After all messages are processed, wait the cycle delay again before checking for new messages
                 user_state["status"] = "Idle 😴"
                 now = _get_now_tz(tz)
                 user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
-                await asyncio.sleep(user_state["cycle"] * 60)
-
+                await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
             except Exception as e:
                 log_event(f"Error in forward loop: {e}")
                 await asyncio.sleep(60)
+
 
     asyncio.create_task(forward_loop())
     try:
@@ -624,6 +664,11 @@ async def run_user_bot(config):
     except Exception as e:
         logger.error(f"[{phone}] Disconnected with error: {e}")
     finally:
+        active_bots.pop(phone, None)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         if phone in started_phones:
             started_phones.remove(phone)
         log_event(f"Bot for {phone} stopped.")
@@ -644,17 +689,35 @@ async def user_loader():
                         with open(path, 'r', encoding="utf-8") as f:
                             config = json.load(f)
                             phone = config.get("phone")
-                            if phone and phone not in started_phones:
-                                asyncio.create_task(run_user_bot(config))
+                            if phone:
+                                if phone not in started_phones:
+                                    asyncio.create_task(run_user_bot(config))
+                                else:
+                                    # Update active bot in place
+                                    if phone in active_bots:
+                                        bot = active_bots[phone]
+                                        bot["config"].update(config)
+                                        # Sync state values
+                                        state = bot["state"]
+                                        state["delay"] = config.get("msg_delay_sec", 20)
+                                        state["cycle"] = config.get("cycle_delay_min", 20)
+                                        # Recalculate next_msg_at if waiting
+                                        tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+                                        state["next_msg_at"] = _get_now_tz(tz) + timedelta(minutes=state["cycle"])
                                 config_mtimes[path] = mtime
                 except Exception as e:
                     logger.error(f"Error loading user config {file}: {e}")
-        await asyncio.sleep(30) # Check every 30s for changes
+        await asyncio.sleep(10) # Check every 10s for faster configuration updates
 
 async def main():
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     os.makedirs(USERS_DIR, exist_ok=True)
     
+    # Write PID file
+    pid_file = "runner.pid"
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
+
     print(f"{Fore.CYAN}{Style.BRIGHT}╔════════════════════════════════════════════╗")
     print(f"{Fore.CYAN}║    {Fore.YELLOW}KURUP ADS V5 ELITE - WORKER ENGINE      {Fore.CYAN}║")
     print(f"{Fore.CYAN}║    {Fore.GREEN}Status: Operational                     {Fore.CYAN}║")
@@ -680,9 +743,20 @@ async def main():
         await user_loader()
     except asyncio.CancelledError:
         pass
+    finally:
+        try:
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown requested. Exiting.")
+        try:
+            if os.path.exists("runner.pid"):
+                os.remove("runner.pid")
+        except Exception:
+            pass
