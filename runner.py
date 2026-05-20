@@ -101,6 +101,15 @@ def _get_now_tz(tz_name: str) -> datetime:
     # Fallback: naive local time
     return datetime.now()
 
+def _get_cycle_seconds_with_jitter(cycle_min: float) -> int:
+    if cycle_min in (7, 20):  # Both legacy default 20 and new default 7 map to 6-8 min (360-480s)
+        return random.randint(360, 480)
+    else:
+        # Custom cycle: add ±15% jitter
+        seconds = int(cycle_min * 60)
+        jitter = int(seconds * 0.15)
+        return random.randint(seconds - jitter, seconds + jitter)
+
 def _in_window(now_t: time, start_t: time, end_t: time) -> bool:
     """True if now is within [start, end) with midnight wrap support."""
     if start_t <= end_t:
@@ -247,7 +256,7 @@ async def run_user_bot(config):
     api_id = int(config["api_id"])
     api_hash = config["api_hash"]
     delay = config.get("msg_delay_sec", 20)
-    cycle = config.get("cycle_delay_min", 20)
+    cycle = config.get("cycle_delay_min", 7)
 
     user_state = {
         "delay": delay,   # seconds between forwards
@@ -723,10 +732,11 @@ async def user_loader():
                                         # Sync state values
                                         state = bot["state"]
                                         state["delay"] = config.get("msg_delay_sec", 20)
-                                        state["cycle"] = config.get("cycle_delay_min", 20)
+                                        state["cycle"] = config.get("cycle_delay_min", 7)
                                         # Recalculate next_msg_at if waiting
                                         tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
-                                        state["next_msg_at"] = _get_now_tz(tz) + timedelta(minutes=state["cycle"])
+                                        sleep_seconds = _get_cycle_seconds_with_jitter(state["cycle"])
+                                        state["next_msg_at"] = _get_now_tz(tz) + timedelta(seconds=sleep_seconds)
                                 config_mtimes[path] = mtime
                 except Exception as e:
                     logger.error(f"Error loading user config {file}: {e}")

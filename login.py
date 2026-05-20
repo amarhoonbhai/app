@@ -78,7 +78,7 @@ def save_user_config(phone: str, data: Dict[str, Any]) -> None:
         "phone": phone,
         "api_id": int(data["api_id"]),
         "api_hash": data["api_hash"],
-        "cycle_delay_min": 20,
+        "cycle_delay_min": 7,
         "msg_delay_sec": 30,
         "groups": [],
 
