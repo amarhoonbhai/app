@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import asyncio
 import logging
@@ -10,6 +11,12 @@ import tempfile
 import shutil
 from datetime import datetime, date, time, timedelta
 from typing import Tuple, List, Optional, Any
+
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except AttributeError:
+    pass
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -227,6 +234,100 @@ clients = {}
 started_phones = set()
 active_bots = {}
 
+def extract_and_normalize_links(text: str) -> List[str]:
+    """
+    Extracts and normalizes Telegram group links or usernames from a string.
+    Handles spaces, commas, and newlines. Normalizes '@username' and 't.me/...'
+    """
+    tokens = re.split(r'[\s,\n]+', text)
+    links = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if token.startswith('@'):
+            links.append(f"https://t.me/{token[1:]}")
+        elif token.startswith('t.me/'):
+            links.append(f"https://{token}")
+        elif token.startswith('telegram.me/'):
+            links.append(f"https://{token}")
+        elif re.match(r'^https?://(?:t\.me|telegram\.me)/\S+$', token):
+            links.append(token)
+    return links
+
+def format_seconds(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    parts = []
+    if h > 0: parts.append(f"{h}h")
+    if m > 0 or h > 0: parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
+
+def _seconds_until_quiet_start(cfg: dict) -> int:
+    tz = cfg.get("tz") or DEFAULT_AUTONIGHT["tz"]
+    now = _get_now_tz(tz)
+    start_t = _parse_hhmm(cfg.get("start", DEFAULT_AUTONIGHT["start"]))
+    today = now.date()
+    start_dt = datetime.combine(today, start_t, tzinfo=now.tzinfo)
+    if now.time() >= start_t:
+        start_dt = start_dt + timedelta(days=1)
+    return int((start_dt - now).total_seconds())
+
+async def check_write_permission(client, entity) -> str:
+    try:
+        from telethon.tl.types import Channel, Chat
+        if isinstance(entity, Channel):
+            if entity.broadcast and not entity.admin_rights:
+                return "Read-Only Channel"
+            if entity.banned_rights and entity.banned_rights.send_messages:
+                return "Muted (Banned)"
+        elif isinstance(entity, Chat):
+            if entity.default_banned_rights and entity.default_banned_rights.send_messages:
+                return "Muted (Default)"
+        
+        try:
+            permissions = await client.get_permissions(entity)
+            if permissions.is_banned:
+                return "Banned"
+            if hasattr(permissions, 'send_messages') and not permissions.send_messages:
+                return "Muted"
+        except Exception:
+            pass
+        return "Healthy"
+    except Exception as e:
+        return f"Access Denied: {type(e).__name__}"
+
+async def resolve_group_entity(client, group_url: str):
+    """
+    Resolves a group URL (public or private invite link) to a Telethon entity.
+    """
+    clean_link = group_url.strip().rstrip('/')
+    
+    # Handle private invite links
+    if "t.me/+" in clean_link or "t.me/joinchat/" in clean_link:
+        if "t.me/+" in clean_link:
+            hash_val = clean_link.split('+')[-1]
+        else:
+            hash_val = clean_link.split('joinchat/')[-1]
+            
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        from telethon.tl.types import ChatInviteAlready, ChatInvite
+        try:
+            res = await client(CheckChatInviteRequest(hash_val))
+            if isinstance(res, ChatInviteAlready) and res.chat:
+                return res.chat
+        except Exception as e:
+            logger.error(f"Error checking chat invite for {group_url}: {e}")
+            
+    # Try to resolve via client.get_entity() directly
+    try:
+        return await client.get_entity(clean_link)
+    except Exception as e:
+        logger.error(f"Failed to get entity for {group_url}: {e}")
+        return group_url
+
 async def interruptible_sleep(get_target_time, tz_name: str):
     while True:
         target = get_target_time()
@@ -388,19 +489,45 @@ async def run_user_bot(config):
 
 
         elif text.startswith(".status"):
-            await event.respond(
-                "📊 Status:\n"
-                f"• Cycle Delay: **{user_state['cycle']} minutes**\n"
-                f"• Message Delay: **{user_state['delay']} seconds**\n"
-                f"• Success: **{user_state['success_total']}**\n"
-                f"• Failed: **{user_state['fail_total']}**\n\n"
-                + autonight_status_text(AUTONIGHT_CFG)
+            tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+            now = _get_now_tz(tz)
+            quiet_countdown = ""
+            if AUTONIGHT_CFG.get("enabled", True):
+                if autonight_is_quiet(AUTONIGHT_CFG):
+                    rem = _seconds_until_quiet_end(AUTONIGHT_CFG)
+                    quiet_countdown = f"\n🌙 **Quiet Hours Active** (Ends in `{format_seconds(rem)}`)"
+                else:
+                    rem = _seconds_until_quiet_start(AUTONIGHT_CFG)
+                    quiet_countdown = f"\n🌙 **Next Quiet Period**: In `{format_seconds(rem)}`"
+            
+            next_msg_str = "N/A"
+            if user_state["next_msg_at"]:
+                next_msg_str = user_state["next_msg_at"].strftime("%H:%M:%S")
+
+            reply = (
+                f"⚙️ **System Status Panel**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🔄 **Current State:** `{user_state['status']}`\n"
+                f"📍 **Target Groups:** `{len(config.setdefault('groups', []))}`\n"
+                f"🕒 **Next Action at:** `{next_msg_str}`\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"⏱ **Cycle Interval:** `{user_state['cycle']} min` (±15% jitter)\n"
+                f"Spacing: `{user_state['delay']} sec` (between groups)\n"
+                f"Mode: `{'Copy' if user_state['use_copy'] else 'Forward'}`\n"
+                f"━━━━━━━━━━━━━━━━━━"
+                + quiet_countdown
             )
+            await event.respond(reply)
 
         elif text.startswith(".stats"):
             tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
             now = _get_now_tz(tz)
             uptime = str(now - user_state["start_time"]).split('.')[0]
+            
+            # Performance Metrics
+            elapsed_seconds = (now - user_state["start_time"]).total_seconds()
+            total_sends = user_state["success_total"] + user_state["fail_total"]
+            sends_per_hour = (total_sends / (elapsed_seconds / 3600)) if elapsed_seconds > 0 else 0.0
             
             # Formatting next delivery time
             next_msg_str = "N/A"
@@ -414,6 +541,15 @@ async def run_user_bot(config):
             elif "Msg" in user_state["status"]:
                 next_label = "🕒 Next Group"
 
+            quiet_countdown = ""
+            if AUTONIGHT_CFG.get("enabled", True):
+                if autonight_is_quiet(AUTONIGHT_CFG):
+                    rem = _seconds_until_quiet_end(AUTONIGHT_CFG)
+                    quiet_countdown = f"🌙 **Quiet Mode**: Ends in `{format_seconds(rem)}`"
+                else:
+                    rem = _seconds_until_quiet_start(AUTONIGHT_CFG)
+                    quiet_countdown = f"🌙 **Next Quiet**: In `{format_seconds(rem)}`"
+
             log_text = "\n".join(user_state["logs"][-5:]) if user_state["logs"] else "No logs yet."
             
             reply = (
@@ -423,6 +559,8 @@ async def run_user_bot(config):
                 f"⏱ **Uptime:** `{uptime}`\n"
                 f"🔄 **Status:** {user_state['status']}\n"
                 f"📍 **Groups:** {len(config.setdefault('groups', []))}\n"
+                f"⚡ **Average Speed:** `{sends_per_hour:.1f} posts/hour`\n"
+                f"{quiet_countdown}\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"✅ **Total Success:** `{user_state['success_total']}`\n"
                 f"❌ **Total Failed:** `{user_state['fail_total']}`\n"
@@ -448,9 +586,10 @@ async def run_user_bot(config):
             await event.respond(reply)
 
         elif text.startswith(".addgroup"):
-            links = re.findall(r'https://t\.me/\S+', text)
+            cmd_arg = text[len(".addgroup"):].strip()
+            links = extract_and_normalize_links(cmd_arg)
             if not links:
-                await event.respond("⚠️ No valid group links found.")
+                await event.respond("⚠️ No valid group links or usernames found.\nFormat: `.addgroup @group1, https://t.me/group2` or split by newlines.")
                 return
             added, skipped = [], []
             groups_list = config.setdefault("groups", [])
@@ -469,9 +608,17 @@ async def run_user_bot(config):
             await event.respond("\n".join(msg) or "No changes.")
 
         elif text.startswith(".delgroup"):
-            links = re.findall(r'https://t\.me/\S+', text)
+            arg = text[len(".delgroup"):].strip().lower()
+            if arg == "all":
+                config["groups"] = []
+                atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+                await event.respond("🗑️ Target groups list cleared completely.")
+                return
+                
+            cmd_arg = text[len(".delgroup"):].strip()
+            links = extract_and_normalize_links(cmd_arg)
             if not links:
-                await event.respond("⚠️ Usage: `.delgroup <link1> <link2> ...`")
+                await event.respond("⚠️ Usage: `.delgroup <link1> ...` or `.delgroup all` to clear list.")
                 return
             removed, skipped = [], []
             groups_list = config.setdefault("groups", [])
@@ -537,17 +684,18 @@ async def run_user_bot(config):
 
 
         elif text.startswith(".join"):
-            links = re.findall(r'https://t\.me/\S+', text)
+            cmd_arg = text[len(".join"):].strip()
+            links = extract_and_normalize_links(cmd_arg)
             if not links:
-                await event.respond("⚠️ Usage: `.join <link1> <link2> ...`")
+                await event.respond("⚠️ Usage: `.join <link1> <link2> ...` (supports usernames and invite links)")
                 return
             
-            await event.respond(f"🔄 Attempting to join {len(links)} groups...")
+            progress_msg = await event.respond(f"🔄 Preparing to join {len(links)} groups...")
             success, fail = 0, 0
-            for link in links:
+            for idx, link in enumerate(links, 1):
                 try:
+                    await progress_msg.edit(f"⏳ **[{idx}/{len(links)}] Joining:** {link}\n*(Anti-Flood delay active)*")
                     clean_link = link.strip().rstrip('/')
-                    # Handle both private and public invite links robustly
                     if "t.me/+" in clean_link:
                         hash_val = clean_link.split('+')[-1]
                         from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -561,28 +709,69 @@ async def run_user_bot(config):
                         from telethon.tl.functions.channels import JoinChannelRequest
                         await client(JoinChannelRequest(username))
                     success += 1
-                    await asyncio.sleep(random.randint(10, 20)) # Wait between joins to prevent flood
                 except Exception as e:
                     logger.error(f"Join error {link}: {e}")
                     fail += 1
-            await event.respond(f"✅ Done! Joined: **{success}**, Failed: **{fail}**")
+                
+                if idx < len(links):
+                    await asyncio.sleep(random.randint(10, 20))
+            await progress_msg.edit(f"📊 **Join Session Complete!**\n━━━━━━━━━━━━━━━━━━\n✅ Successfully Joined: **{success}**\n❌ Failed / Already Joined: **{fail}**")
 
+        elif text.startswith(".check"):
+            groups_list = config.setdefault("groups", [])
+            if not groups_list:
+                await event.respond("📋 No groups configured to check.")
+                return
+            
+            progress_msg = await event.respond(f"🔍 Auditing permissions on {len(groups_list)} groups...")
+            results = []
+            for idx, group in enumerate(groups_list, 1):
+                try:
+                    target_entity = await resolve_group_entity(client, group)
+                    if isinstance(target_entity, str):
+                        results.append(f"{idx}. 🚫 **{group}** | Access Denied")
+                        continue
+                    
+                    status = await check_write_permission(client, target_entity)
+                    if status == "Healthy":
+                        results.append(f"{idx}. ✅ **{target_entity.title}** | Healthy")
+                    else:
+                        results.append(f"{idx}. ⚠️ **{target_entity.title}** | {status}")
+                except Exception as e:
+                    results.append(f"{idx}. ❓ **{group}** | Error: {type(e).__name__}")
+            
+            # Send chunked responses
+            current_chunk = ["📊 **Group Health Report**", "━━━━━━━━━━━━━━━━━━"]
+            current_len = sum(len(line) for line in current_chunk)
+            for line in results:
+                if current_len + len(line) + 1 > 4000:
+                    await event.respond("\n".join(current_chunk))
+                    current_chunk = [line]
+                    current_len = len(line)
+                else:
+                    current_chunk.append(line)
+                    current_len += len(line) + 1
+            if current_chunk:
+                await progress_msg.delete()
+                await event.respond("\n".join(current_chunk))
 
         elif text.startswith(".help"):
             await event.respond(
                 "🎁 **TELETHON V5 ELITE ADVANCED MODULE**\n\n"
-                "🛠 **Timing & Mode:**\n"
+                "🛠 **Timing & Mode Configuration:**\n"
                 "• `.time <m|h>` — Set cycle interval\n"
                 "• `.delay <sec>` — Set message spacing\n"
                 "• `.mode <copy|forward>` — Switch sending style\n"
-                "\n🛰 **Management:**\n"
-                "• `.addgroup <url>` — Add target group\n"
-                "• `.delgroup <url>` — Remove group\n"
-                "• `.groups` — Show target list\n"
-                "• `.join <url>` — Join new groups\n"
-                "\n📊 **Stats & Info:**\n"
-                "• `.stats` — Detailed performance\n"
-                "• `.status` | `.info` | `.night`"
+                "\n🛰 **Target Groups Management:**\n"
+                "• `.addgroup <url>` — Add target group(s) (comma/space/newline split)\n"
+                "• `.delgroup <url|all>` — Remove group(s) or clear the list\n"
+                "• `.groups` — Show all target groups\n"
+                "• `.join <url>` — Join new groups (bulk support)\n"
+                "• `.check` — Audit send permissions on all groups\n"
+                "\n📊 **System Monitoring & Settings:**\n"
+                "• `.stats` — Display detailed runtime metrics & speed\n"
+                "• `.status` — Display sleek system configuration state\n"
+                "• `.info` | `.night` — Account details and Auto-Night window"
             )
 
     async def forward_loop():
@@ -645,16 +834,18 @@ async def run_user_bot(config):
                         custom_sleep_done = False
                         
                         try:
+                            target_entity = await resolve_group_entity(client, group)
                             if user_state["use_copy"]:
                                 # 🌈 Copy Mode
                                 caption = msg.text or ""
-                                if msg.media:
-                                    await client.send_file(group, msg.media, caption=caption)
+                                from telethon.tl.types import MessageMediaWebPage
+                                if msg.media and not isinstance(msg.media, MessageMediaWebPage):
+                                    await client.send_file(target_entity, msg.media, caption=caption)
                                 else:
-                                    await client.send_message(group, caption)
+                                    await client.send_message(target_entity, caption)
                             else:
                                 # 🔄 Forward Mode
-                                await client.forward_messages(group, msg)
+                                await client.forward_messages(target_entity, msg)
 
                             user_state["success_total"] += 1
                             user_state["current_cycle_success"] += 1

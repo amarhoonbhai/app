@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import json
 import subprocess
@@ -6,6 +7,12 @@ import tempfile
 import shutil
 from datetime import datetime, timedelta, time
 from typing import Dict, Any
+
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except AttributeError:
+    pass
 
 from telethon.sync import TelegramClient
 from telethon.errors import (
@@ -264,11 +271,13 @@ def login_new_user(users: Dict[str, Any]):
     name = input("  Account Name: ").strip()
     api_id = input("  API ID: ").strip()
     api_hash = input("  API HASH: ").strip()
-    phone = input("  Phone (with +country): ").strip()
+    phone_raw = input("  Phone (with +country): ").strip()
 
     if not api_id.isdigit():
         print(Fore.RED + "  [!] API ID must be numeric.")
         return
+
+    phone = re.sub(r'[^\d+]', '', phone_raw)
 
     session_path = os.path.join(SESSIONS_DIR, f"{phone}.session")
     client = TelegramClient(session_path, int(api_id), api_hash)
@@ -281,15 +290,23 @@ def login_new_user(users: Dict[str, Any]):
             except FloodWaitError as e:
                 print(Fore.RED + f"  [!] FloodWait: {e.seconds}s remaining.")
                 return
+            except Exception as e:
+                print(Fore.RED + f"  [!] Failed to send verification code request.")
+                print(Fore.RED + f"      Details: {e}")
+                return
 
             code = input("  Enter Telegram Code: ").strip()
             try:
                 client.sign_in(phone, code)
             except SessionPasswordNeededError:
                 password = input("  2FA Password: ").strip()
-                client.sign_in(password=password)
+                try:
+                    client.sign_in(password=password)
+                except Exception as e:
+                    print(Fore.RED + f"  [!] 2FA Sign-in Failed: {e}")
+                    return
             except Exception as e:
-                print(Fore.RED + f"  [!] Login Failed: {e}")
+                print(Fore.RED + f"  [!] Sign-in Failed: {e}")
                 return
 
         me = client.get_me()
