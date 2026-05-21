@@ -1,8 +1,34 @@
 import os
 import sys
+import subprocess
+
+# Auto-install dependencies if missing
+required_packages = {
+    "telethon": "telethon==1.34.0",
+    "colorama": "colorama==0.4.6"
+}
+
+missing_packages = []
+for module_name, package_name in required_packages.items():
+    try:
+        __import__(module_name)
+    except ImportError:
+        missing_packages.append(package_name)
+
+if missing_packages:
+    print(f"[*] Missing dependencies detected: {missing_packages}")
+    print("[*] Installing missing dependencies automatically...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing_packages)
+        print("[*] Dependencies installed successfully. Restarting...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print(f"[!] Auto-installation failed: {e}")
+        print("[!] Please run: pip install -r requirements.txt")
+        sys.exit(1)
+
 import re
 import json
-import subprocess
 import tempfile
 import shutil
 from datetime import datetime, timedelta, time
