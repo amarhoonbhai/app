@@ -128,11 +128,20 @@ def _parse_hhmm(s: str) -> time:
     return time(h, mm)
 
 def _get_now_tz(tz_name: str) -> datetime:
+    if not tz_name:
+        tz_name = "Asia/Kolkata"
     if ZoneInfo is not None:
         try:
             return datetime.now(ZoneInfo(tz_name))
         except Exception:
             pass
+    # Fallback to timezone offset if we know it's India time
+    try:
+        from datetime import timezone, timedelta
+        if tz_name == "Asia/Kolkata":
+            return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    except Exception:
+        pass
     # Fallback: naive local time
     return datetime.now()
 
@@ -152,8 +161,10 @@ def _in_window(now_t: time, start_t: time, end_t: time) -> bool:
     # crosses midnight, e.g., 23:00 -> 07:00
     return (now_t >= start_t) or (now_t < end_t)
 
-def _seconds_until_quiet_end(cfg: dict) -> int:
+def _seconds_until_quiet_end(cfg: dict = None) -> int:
     """Return seconds until the end of quiet window (>= 1), assuming we are currently in quiet."""
+    if cfg is None or cfg is AUTONIGHT_CFG:
+        cfg = reload_autonight_cfg()
     tz = cfg.get("tz") or DEFAULT_AUTONIGHT["tz"]
     now = _get_now_tz(tz)
     start_t = _parse_hhmm(cfg.get("start", DEFAULT_AUTONIGHT["start"]))
@@ -176,7 +187,9 @@ def _seconds_until_quiet_end(cfg: dict) -> int:
     seconds = int((end_dt - now).total_seconds())
     return max(1, seconds)
 
-def autonight_is_quiet(cfg: dict) -> bool:
+def autonight_is_quiet(cfg: dict = None) -> bool:
+    if cfg is None or cfg is AUTONIGHT_CFG:
+        cfg = reload_autonight_cfg()
     if not cfg.get("enabled", True):
         return False
     try:
@@ -188,7 +201,9 @@ def autonight_is_quiet(cfg: dict) -> bool:
         # Fail open if config broken
         return False
 
-def autonight_status_text(cfg: dict) -> str:
+def autonight_status_text(cfg: dict = None) -> str:
+    if cfg is None or cfg is AUTONIGHT_CFG:
+        cfg = reload_autonight_cfg()
     state = "ACTIVE ✅" if cfg.get("enabled", True) else "DISABLED ❌"
     return (
         f"🌙 Auto-Night: **{state}**\n"
@@ -293,7 +308,9 @@ def format_seconds(seconds: int) -> str:
     parts.append(f"{s}s")
     return " ".join(parts)
 
-def _seconds_until_quiet_start(cfg: dict) -> int:
+def _seconds_until_quiet_start(cfg: dict = None) -> int:
+    if cfg is None or cfg is AUTONIGHT_CFG:
+        cfg = reload_autonight_cfg()
     tz = cfg.get("tz") or DEFAULT_AUTONIGHT["tz"]
     now = _get_now_tz(tz)
     start_t = _parse_hhmm(cfg.get("start", DEFAULT_AUTONIGHT["start"]))
@@ -373,6 +390,11 @@ async def interruptible_sleep(get_target_time, tz_name: str):
 # Global Auto-Night config (shared across accounts)
 AUTONIGHT_CFG = _load_autonight()
 
+def reload_autonight_cfg() -> dict:
+    global AUTONIGHT_CFG
+    AUTONIGHT_CFG = _load_autonight()
+    return AUTONIGHT_CFG
+
 async def run_user_bot(config):
     phone = config["phone"]
     if phone in started_phones:
@@ -398,7 +420,7 @@ async def run_user_bot(config):
         "next_msg_at": None,
         "status": "Idle 😴",
         "logs": [],
-        "start_time": _get_now_tz(AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"]))
+        "start_time": _get_now_tz(reload_autonight_cfg().get("tz", DEFAULT_AUTONIGHT["tz"]))
     }
 
     active_bots[phone] = {
@@ -408,7 +430,7 @@ async def run_user_bot(config):
     }
 
     def log_event(msg):
-        tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+        tz = reload_autonight_cfg().get("tz", DEFAULT_AUTONIGHT["tz"])
         now = _get_now_tz(tz)
         ts = now.strftime("%H:%M:%S")
         
@@ -991,10 +1013,6 @@ async def user_loader():
                                         state = bot["state"]
                                         state["delay"] = config.get("msg_delay_sec", 20)
                                         state["cycle"] = config.get("cycle_delay_min", 7)
-                                        # Recalculate next_msg_at if waiting
-                                        tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
-                                        sleep_seconds = _get_cycle_seconds_with_jitter(state["cycle"])
-                                        state["next_msg_at"] = _get_now_tz(tz) + timedelta(seconds=sleep_seconds)
                                 config_mtimes[path] = mtime
                 except Exception as e:
                     logger.error(f"Error loading user config {file}: {e}")
