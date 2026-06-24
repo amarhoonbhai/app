@@ -77,25 +77,7 @@ DEFAULT_AUTONIGHT = {
 }
 
 
-def atomic_save_json(path: str, data: Any) -> bool:
-    """Save JSON data to a file atomically using a temporary file."""
-    temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
-    try:
-        with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        # On Windows, os.replace might fail if the destination exists and is open
-        # but shutil.move/os.replace is generally the way to go.
-        try:
-            os.replace(temp_path, path)
-        except OSError:
-            # Fallback if os.replace fails (e.g. permission issues on some environments)
-            shutil.move(temp_path, path)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save JSON to {path}: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return False
+
 
 def _load_autonight() -> dict:
     return db.get_autonight_settings()
@@ -932,6 +914,7 @@ async def run_user_bot(config):
                 
                 # Filter out messages that cannot be sent (empty text & no media)
                 valid_messages = [m for m in messages if m.text or m.media]
+                valid_messages.reverse()
 
                 if not valid_messages:
                     log_event("No valid messages in Saved Messages.")
@@ -983,7 +966,7 @@ async def run_user_bot(config):
                              user_state["status"] = f"FloodWait ⏳ ({e.seconds}s)"
                              user_state["delay"] = min(user_state["delay"] + 20, 600)
                              config["msg_delay_sec"] = user_state["delay"]
-                             atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+                             db.update_user_config(phone, msg_delay_sec=user_state["delay"])
                              now = _get_now_tz(tz)
                              user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 5)
                              await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
@@ -1027,7 +1010,7 @@ async def run_user_bot(config):
                         if user_state["delay"] > 25:
                             user_state["delay"] -= 2
                             config["msg_delay_sec"] = user_state["delay"]
-                            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+                            db.update_user_config(phone, msg_delay_sec=user_state["delay"])
 
                     log_event(f"Msg {msg_idx} cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
                     
