@@ -154,29 +154,53 @@ def is_runner_running() -> bool:
 
 def stop_runner():
     pid_file = PID_FILE
-    if not os.path.exists(pid_file):
-        print(Fore.YELLOW + "  [!] No PID file found. Engine might not be running.")
-        return
-    try:
-        with open(pid_file, "r") as f:
-            pid = int(f.read().strip())
-    except Exception:
-        print(Fore.RED + "  [!] Failed to read PID file.")
-        return
+    pid = None
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r") as f:
+                pid = int(f.read().strip())
+        except Exception:
+            pass
 
-    print(Fore.YELLOW + f"  [🔁] Stopping background engine (PID: {pid})...")
+    if pid:
+        print(Fore.YELLOW + f"  [🔁] Stopping background engine (PID: {pid})...")
+        try:
+            if os.name == 'nt':
+                subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                import signal
+                os.kill(pid, signal.SIGTERM)
+                # Wait up to 3 seconds for the process to exit gracefully
+                for _ in range(30):
+                    import time as pytime
+                    pytime.sleep(0.1)
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        break
+                else:
+                    # Force kill if still alive
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+        except Exception as e:
+            print(Fore.RED + f"  [!] Failed to stop engine PID {pid}: {e}")
+
+    # Backup: Terminate any orphaned/duplicate runner.py processes on the system
+    print(Fore.YELLOW + "  [🔁] Cleaning up any remaining runner processes...")
     try:
         if os.name == 'nt':
-            subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run('wmic process where "CommandLine like \'%runner.py%\'" call terminate', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            import signal
-            os.kill(pid, signal.SIGTERM)
-    except Exception as e:
-        print(Fore.RED + f"  [!] Failed to stop engine: {e}")
-    finally:
+            subprocess.run("pkill -9 -f runner.py", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    # Clean up PID file
+    if os.path.exists(pid_file):
         try:
-            if os.path.exists(pid_file):
-                os.remove(pid_file)
+            os.remove(pid_file)
         except Exception:
             pass
 
