@@ -59,12 +59,10 @@ from colorama import Fore, Style, init
 
 # ---------- Init ----------
 init(autoreset=True)
+import db
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
-USERS_DIR    = os.path.join(APP_DIR, "users")
-USERS_FILE   = os.path.join(APP_DIR, "users.json")
-AUTONIGHT_FILE = os.path.join(APP_DIR, "autonight.json")
 PID_FILE = os.path.join(APP_DIR, "runner.pid")
 RUNNER_LOG = os.path.join(APP_DIR, "runner.log")
 AUTONIGHT_DEFAULT = {
@@ -97,37 +95,16 @@ def atomic_save_json(path: str, data: Any) -> bool:
 # ---------- Files & Config ----------
 def ensure_dirs():
     os.makedirs(SESSIONS_DIR, exist_ok=True)
-    os.makedirs(USERS_DIR, exist_ok=True)
-    if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f)
-    if not os.path.exists(AUTONIGHT_FILE):
-        with open(AUTONIGHT_FILE, "w", encoding="utf-8") as f:
-            json.dump(AUTONIGHT_DEFAULT, f, ensure_ascii=False, indent=2)
+    db.init_db()
 
 def load_users() -> Dict[str, Any]:
-    if not os.path.exists(USERS_FILE):
-        return {}
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return db.get_users_dict()
 
 def save_users(users: Dict[str, Any]) -> None:
-    atomic_save_json(USERS_FILE, users)
+    pass
 
 def save_user_config(phone: str, data: Dict[str, Any]) -> None:
-    user_config = {
-        "name": data["name"],
-        "phone": phone,
-        "api_id": int(data["api_id"]),
-        "api_hash": data["api_hash"],
-        "cycle_delay_min": 7,
-        "msg_delay_sec": 30,
-        "groups": [],
-
-        "plan_expiry": "Lifetime"
-    }
-
-    atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), user_config)
+    db.save_user(phone, data["name"], int(data["api_id"]), data["api_hash"])
 
 # ---------- UI Helpers ----------
 def list_users(users: Dict[str, Any]) -> None:
@@ -262,8 +239,7 @@ def _parse_hhmm(s: str) -> time:
     return time(h, mm)
 
 def show_autonight():
-    with open(AUTONIGHT_FILE, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = db.get_autonight_settings()
     state = f"{Fore.GREEN}ACTIVE ✅" if cfg.get("enabled", True) else f"{Fore.RED}DISABLED ❌"
     print(Fore.MAGENTA + Style.BRIGHT + "\n  🌙 Auto-Night Configuration")
     print(Fore.WHITE + f"  Current Status : {state}")
@@ -272,8 +248,7 @@ def show_autonight():
     print(Fore.CYAN + "  " + "─" * 40)
 
 def edit_autonight():
-    with open(AUTONIGHT_FILE, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = db.get_autonight_settings()
 
     print(Style.BRIGHT + "\n  Edit Auto-Night (Press Enter to skip)")
     en = input(f"  Enable? [y/n] (Current: {'on' if cfg.get('enabled',True) else 'off'}): ").strip().lower()
@@ -302,7 +277,7 @@ def edit_autonight():
     if tz_in:
         cfg["tz"] = tz_in
 
-    atomic_save_json(AUTONIGHT_FILE, cfg)
+    db.save_autonight_settings(cfg)
     print(Fore.GREEN + "  [✔] Auto-Night settings updated.")
     show_autonight()
 
@@ -365,11 +340,12 @@ def delete_user(users: Dict[str, Any]):
     phone = input("  Phone number to delete: ").strip()
     if phone in users:
         session_file = os.path.join(SESSIONS_DIR, f"{phone}.session")
-        config_file = os.path.join(USERS_DIR, f"{phone}.json")
-        for f in [session_file, config_file]:
-            if os.path.exists(f): os.remove(f)
-        users.pop(phone)
-        save_users(users)
+        if os.path.exists(session_file):
+            try:
+                os.remove(session_file)
+            except Exception:
+                pass
+        db.delete_user(phone)
         print(Fore.RED + f"  [✖] Account {phone} removed.")
     else:
         print(Fore.YELLOW + "  [!] Account not found.")

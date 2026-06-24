@@ -63,12 +63,12 @@ import telethon.utils as tel_utils
 from colorama import Fore, Style, init
 
 init(autoreset=True)
+import db
 
 
 # =========================
 # Auto-Night configuration
 # =========================
-AUTONIGHT_PATH = os.path.join(os.path.dirname(__file__), "autonight.json")
 DEFAULT_AUTONIGHT = {
     "enabled": True,
     "start": "00:00",        # 24h format HH:MM
@@ -98,18 +98,10 @@ def atomic_save_json(path: str, data: Any) -> bool:
         return False
 
 def _load_autonight() -> dict:
-    cfg = DEFAULT_AUTONIGHT.copy()
-    try:
-        if os.path.exists(AUTONIGHT_PATH):
-            with open(AUTONIGHT_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                cfg.update({k: data.get(k, cfg[k]) for k in cfg})
-    except Exception:
-        pass
-    return cfg
+    return db.get_autonight_settings()
 
 def _save_autonight(cfg: dict) -> None:
-    atomic_save_json(AUTONIGHT_PATH, cfg)
+    db.save_autonight_settings(cfg)
 
 def _parse_hhmm(s: str) -> time:
     s = s.strip()
@@ -272,7 +264,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-USERS_DIR = os.path.join(APP_DIR, "users")
 SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
 PID_FILE = os.path.join(APP_DIR, "runner.pid")
 clients = {}
@@ -412,14 +403,7 @@ async def run_user_bot(config):
     cycle = config.get("cycle_delay_min", 7)
 
     # Load persistent errors
-    errors_path = os.path.join(USERS_DIR, f"{phone}_errors.json")
-    loaded_errors = []
-    if os.path.exists(errors_path):
-        try:
-            with open(errors_path, 'r', encoding="utf-8") as f:
-                loaded_errors = json.load(f)
-        except Exception:
-            pass
+    loaded_errors = db.get_errors(phone)
 
     user_state = {
         "delay": delay,   # seconds between forwards
@@ -472,16 +456,8 @@ async def run_user_bot(config):
             user_state["logs"].pop(0)
             
         if is_err:
-            err_entry = {
-                "timestamp": ts,
-                "message": msg,
-                "details": details
-            }
-            user_state["errors"].append(err_entry)
-            if len(user_state["errors"]) > 15:
-                user_state["errors"].pop(0)
-            errors_path = os.path.join(USERS_DIR, f"{phone}_errors.json")
-            atomic_save_json(errors_path, user_state["errors"])
+            db.log_error(phone, ts, msg, details)
+            user_state["errors"] = db.get_errors(phone)
         logger.info(f"[{phone}] {msg}")
 
     client = TelegramClient(session_path, api_id, api_hash)
@@ -551,7 +527,7 @@ async def run_user_bot(config):
                 
             user_state["cycle"] = value
             config["cycle_delay_min"] = value
-            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            db.update_user_config(phone, cycle_delay_min=value)
             
             tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
             sleep_seconds = _get_cycle_seconds_with_jitter(value)
@@ -570,7 +546,7 @@ async def run_user_bot(config):
                 
             user_state["delay"] = value
             config["msg_delay_sec"] = value
-            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            db.update_user_config(phone, msg_delay_sec=value)
             
             tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
             user_state["next_msg_at"] = _get_now_tz(tz) + timedelta(seconds=value)
@@ -688,7 +664,7 @@ async def run_user_bot(config):
                     added.append(link)
                 else:
                     skipped.append(link)
-            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            db.update_user_config(phone, groups=groups_list)
             msg = []
             if added:
                 msg.append(f"✅ Added **{len(added)}** new group(s).")
@@ -698,7 +674,7 @@ async def run_user_bot(config):
 
         elif text.startswith(".delall"):
             config["groups"] = []
-            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            db.update_user_config(phone, groups=[])
             await event.respond("🗑️ Target groups list cleared completely.")
             return
 
@@ -706,7 +682,7 @@ async def run_user_bot(config):
             arg = text[len(".delgroup"):].strip().lower()
             if arg == "all" or arg == "al":
                 config["groups"] = []
-                atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+                db.update_user_config(phone, groups=[])
                 await event.respond("🗑️ Target groups list cleared completely.")
                 return
                 
@@ -729,7 +705,7 @@ async def run_user_bot(config):
                     removed.append(link)
                 else:
                     skipped.append(link)
-            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            db.update_user_config(phone, groups=groups_list)
             msg = []
             if removed:
                 msg.append(f"✅ Removed **{len(removed)}** group(s).")
@@ -863,12 +839,7 @@ async def run_user_bot(config):
             
             if arg.lower() == "clear":
                 user_state["errors"] = []
-                errors_path = os.path.join(USERS_DIR, f"{phone}_errors.json")
-                if os.path.exists(errors_path):
-                    try:
-                        os.remove(errors_path)
-                    except Exception:
-                        pass
+                db.clear_errors(phone)
                 await event.respond("🗑️ Error logs cleared successfully.")
                 return
 
@@ -1098,41 +1069,35 @@ async def run_user_bot(config):
         log_event(f"Bot for {phone} stopped.")
 
 async def user_loader():
-    config_mtimes = {} # path -> last_mtime
+    config_mtimes = {} # phone -> last_updated_at
     while True:
-        if not os.path.exists(USERS_DIR):
-            os.makedirs(USERS_DIR, exist_ok=True)
-            
-        for file in os.listdir(USERS_DIR):
-            if file.endswith(".json"):
-                path = os.path.join(USERS_DIR, file)
-                try:
-                    mtime = os.path.getmtime(path)
-                    # Only load if new or modified
-                    if path not in config_mtimes or mtime > config_mtimes[path]:
-                        with open(path, 'r', encoding="utf-8") as f:
-                            config = json.load(f)
-                            phone = config.get("phone")
-                            if phone:
-                                if phone not in started_phones:
-                                    asyncio.create_task(run_user_bot(config))
-                                else:
-                                    # Update active bot in place
-                                    if phone in active_bots:
-                                        bot = active_bots[phone]
-                                        bot["config"].update(config)
-                                        # Sync state values
-                                        state = bot["state"]
-                                        state["delay"] = config.get("msg_delay_sec", 20)
-                                        state["cycle"] = config.get("cycle_delay_min", 7)
-                                config_mtimes[path] = mtime
-                except Exception as e:
-                    logger.error(f"Error loading user config {file}: {e}")
+        try:
+            configs = db.get_all_user_configs()
+            for config in configs:
+                phone = config.get("phone")
+                updated_at = config.get("updated_at", 0.0)
+                if not phone:
+                    continue
+                # Only load if new or modified
+                if phone not in config_mtimes or updated_at > config_mtimes[phone]:
+                    if phone not in started_phones:
+                        asyncio.create_task(run_user_bot(config))
+                    else:
+                        # Update active bot in place
+                        if phone in active_bots:
+                            bot = active_bots[phone]
+                            bot["config"].update(config)
+                            # Sync state values
+                            state = bot["state"]
+                            state["delay"] = config.get("msg_delay_sec", 20)
+                            state["cycle"] = config.get("cycle_delay_min", 7)
+                    config_mtimes[phone] = updated_at
+        except Exception as e:
+            logger.error(f"Error loading user configs from database: {e}")
         await asyncio.sleep(10) # Check every 10s for faster configuration updates
 
 async def main():
     os.makedirs(SESSIONS_DIR, exist_ok=True)
-    os.makedirs(USERS_DIR, exist_ok=True)
     
     # Write PID file
     pid_file = PID_FILE
@@ -1144,10 +1109,6 @@ async def main():
     print(f"{Fore.CYAN}║    {Fore.GREEN}Status: Operational                     {Fore.CYAN}║")
     print(f"{Fore.CYAN}╚════════════════════════════════════════════╝{Style.RESET_ALL}")
     print(f"{Fore.WHITE}Logs will appear below in real-time...\n")
-
-    # Ensure Auto-Night config file exists
-    if not os.path.exists(AUTONIGHT_PATH):
-        _save_autonight(AUTONIGHT_CFG)
     
     # Setup signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()
