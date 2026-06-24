@@ -413,8 +413,8 @@ def start():
         print(f"  {Fore.CYAN}4.{Fore.WHITE} View Auto-Night Status")
         print(f"  {Fore.CYAN}5.{Fore.WHITE} Config Auto-Night Mode")
         print(f"  {Fore.CYAN}─" * 25)
-        print(f"  {Fore.CYAN}6.{Fore.WHITE} {Fore.BLUE}Account Health Verification")
-        print(f"  {Fore.CYAN}7.{Fore.WHITE} {Fore.MAGENTA}Run One-Time Scheduler (Schedule on Telegram)")
+        print(f"  {Fore.CYAN}6.{Fore.WHITE} {Fore.YELLOW}RESTART BACKGROUND ENGINE")
+        print(f"  {Fore.CYAN}7.{Fore.WHITE} {Fore.BLUE}Account Health Verification")
         print(f"  {Fore.CYAN}8.{Fore.WHITE} Close Manager")
         
         choice = input(Fore.YELLOW + "\n  ❯ Select an option [1-8]: " + Style.RESET_ALL).strip()
@@ -430,14 +430,12 @@ def start():
         elif choice == '5':
             edit_autonight()
         elif choice == '6':
-            check_account_health(users)
+            stop_runner()
+            import time as pytime
+            pytime.sleep(1.5)
+            start_runner_if_needed()
         elif choice == '7':
-            import scheduler
-            import asyncio
-            try:
-                asyncio.run(scheduler.schedule_menu())
-            except Exception as e:
-                print(Fore.RED + f"  [!] Scheduler execution error: {e}")
+            check_account_health(users)
         elif choice == '8':
             print(Fore.CYAN + "\n  Goodbye!")
             break
