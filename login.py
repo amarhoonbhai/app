@@ -209,11 +209,15 @@ def start_runner_if_needed():
 
     import sys
     python_cmd = sys.executable
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    runner_path = os.path.join(app_dir, "runner.py")
+
     if os.name == "nt":
         # Windows: Start in a new console window so logs are visible
         try:
             subprocess.Popen(
-                [python_cmd, "runner.py"],
+                [python_cmd, runner_path],
+                cwd=app_dir,
                 creationflags=subprocess.CREATE_NEW_CONSOLE
             )
             print(Fore.CYAN + f"  [🔁] Background engine started in a NEW window.")
@@ -221,9 +225,11 @@ def start_runner_if_needed():
             print(Fore.RED + f"  [!] Failed to start engine: {e}")
     else:
         # Linux: Start in background with log file
-        with open(RUNNER_LOG, "ab") as logf:
+        log_path = os.path.join(app_dir, RUNNER_LOG)
+        with open(log_path, "ab") as logf:
             subprocess.Popen(
-                [python_cmd, "runner.py"],
+                [python_cmd, runner_path],
+                cwd=app_dir,
                 stdout=logf,
                 stderr=logf,
                 start_new_session=True

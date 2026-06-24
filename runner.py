@@ -409,6 +409,16 @@ async def run_user_bot(config):
     delay = config.get("msg_delay_sec", 20)
     cycle = config.get("cycle_delay_min", 7)
 
+    # Load persistent errors
+    errors_path = os.path.join(USERS_DIR, f"{phone}_errors.json")
+    loaded_errors = []
+    if os.path.exists(errors_path):
+        try:
+            with open(errors_path, 'r', encoding="utf-8") as f:
+                loaded_errors = json.load(f)
+        except Exception:
+            pass
+
     user_state = {
         "delay": delay,   # seconds between forwards
         "cycle": cycle,   # minutes between cycles
@@ -420,6 +430,7 @@ async def run_user_bot(config):
         "next_msg_at": None,
         "status": "Idle 😴",
         "logs": [],
+        "errors": loaded_errors,
         "start_time": _get_now_tz(reload_autonight_cfg().get("tz", DEFAULT_AUTONIGHT["tz"]))
     }
 
@@ -429,7 +440,7 @@ async def run_user_bot(config):
         "config": config
     }
 
-    def log_event(msg):
+    def log_event(msg, details=None):
         tz = reload_autonight_cfg().get("tz", DEFAULT_AUTONIGHT["tz"])
         now = _get_now_tz(tz)
         ts = now.strftime("%H:%M:%S")
@@ -439,12 +450,14 @@ async def run_user_bot(config):
         icon = "ℹ"
         
         lower_msg = msg.lower()
+        is_err = False
         if "success" in lower_msg:
             color = Fore.GREEN
             icon = "✔"
         elif "failed" in lower_msg or "error" in lower_msg or "floodwait" in lower_msg:
             color = Fore.RED
             icon = "✖"
+            is_err = True
         elif "processing" in lower_msg:
             color = Fore.CYAN
             icon = "📡"
@@ -455,6 +468,18 @@ async def run_user_bot(config):
         user_state["logs"].append(f"[{ts}] {msg}")
         if len(user_state["logs"]) > 10:
             user_state["logs"].pop(0)
+            
+        if is_err:
+            err_entry = {
+                "timestamp": ts,
+                "message": msg,
+                "details": details
+            }
+            user_state["errors"].append(err_entry)
+            if len(user_state["errors"]) > 15:
+                user_state["errors"].pop(0)
+            errors_path = os.path.join(USERS_DIR, f"{phone}_errors.json")
+            atomic_save_json(errors_path, user_state["errors"])
         logger.info(f"[{phone}] {msg}")
 
     client = TelegramClient(session_path, api_id, api_hash)
@@ -480,7 +505,19 @@ async def run_user_bot(config):
         except Exception:
             pass
 
+    def command_wrapper(func):
+        async def wrapper(event):
+            try:
+                await func(event)
+            except Exception as e:
+                import traceback
+                tb_str = traceback.format_exc()
+                logger.error(f"Error in command handler: {e}", exc_info=True)
+                log_event(f"Command Error: {type(e).__name__} - {e}", details=tb_str)
+        return wrapper
+
     @client.on(events.NewMessage(outgoing=True))
+    @command_wrapper
     async def command_handler(event):
         text = (event.raw_text or "").strip()
         if not text.startswith("."):
@@ -635,11 +672,11 @@ async def run_user_bot(config):
 
             await event.respond(reply)
 
-        elif text.startswith(".addgroup"):
-            cmd_arg = text[len(".addgroup"):].strip()
+        elif text.startswith(".add"):
+            cmd_arg = text[len(".addgroup"):].strip() if text.startswith(".addgroup") else text[len(".add"):].strip()
             links = extract_and_normalize_links(cmd_arg)
             if not links:
-                await event.respond("⚠️ No valid group links or usernames found.\nFormat: `.addgroup @group1, https://t.me/group2` or split by newlines.")
+                await event.respond("⚠️ No valid group links or usernames found.\nFormat: `.add @group1` or `.addgroup @group1, https://t.me/group2` or split by newlines.")
                 return
             added, skipped = [], []
             groups_list = config.setdefault("groups", [])
@@ -657,9 +694,15 @@ async def run_user_bot(config):
                 msg.append(f"⚠️ Skipped **{len(skipped)}** duplicate(s).")
             await event.respond("\n".join(msg) or "No changes.")
 
+        elif text.startswith(".delall"):
+            config["groups"] = []
+            atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
+            await event.respond("🗑️ Target groups list cleared completely.")
+            return
+
         elif text.startswith(".delgroup"):
             arg = text[len(".delgroup"):].strip().lower()
-            if arg == "all":
+            if arg == "all" or arg == "al":
                 config["groups"] = []
                 atomic_save_json(os.path.join(USERS_DIR, f"{phone}.json"), config)
                 await event.respond("🗑️ Target groups list cleared completely.")
@@ -790,6 +833,12 @@ async def run_user_bot(config):
                 except Exception as e:
                     results.append(f"{idx}. ❓ **{group}** | Error: {type(e).__name__}")
             
+            # Delete progress message safely
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+
             # Send chunked responses
             current_chunk = ["📊 **Group Health Report**", "━━━━━━━━━━━━━━━━━━"]
             current_len = sum(len(line) for line in current_chunk)
@@ -802,8 +851,61 @@ async def run_user_bot(config):
                     current_chunk.append(line)
                     current_len += len(line) + 1
             if current_chunk:
-                await progress_msg.delete()
                 await event.respond("\n".join(current_chunk))
+
+        elif text.startswith(".errors") or text.startswith(".error"):
+            arg = text[len(".error"):].strip() if text.startswith(".error") else text[len(".errors"):].strip()
+            # If command started with space, strip it further
+            if arg.startswith("s"): # just in case of typos
+                arg = arg[1:].strip()
+            
+            if arg.lower() == "clear":
+                user_state["errors"] = []
+                errors_path = os.path.join(USERS_DIR, f"{phone}_errors.json")
+                if os.path.exists(errors_path):
+                    try:
+                        os.remove(errors_path)
+                    except Exception:
+                        pass
+                await event.respond("🗑️ Error logs cleared successfully.")
+                return
+
+            if arg.isdigit():
+                idx = int(arg) - 1
+                errs = user_state.get("errors", [])
+                if idx < 0 or idx >= len(errs):
+                    await event.respond(f"⚠️ Invalid error index. Range: 1-{len(errs)}")
+                else:
+                    err = errs[idx]
+                    details = err.get("details") or "No further traceback details available."
+                    # Send traceback details inside code block
+                    reply = (
+                        f"❌ **Error Detail #{idx + 1}**\n"
+                        f"🕒 **Time:** `{err['timestamp']}`\n"
+                        f"📝 **Message:** `{err['message']}`\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🔍 **Traceback / Context:**\n"
+                        f"```python\n{details}\n```"
+                    )
+                    await event.respond(reply)
+                return
+
+            err_list = user_state.get("errors", [])
+            if not err_list:
+                await event.respond("📋 No errors recorded.")
+            else:
+                lines = [
+                    "❌ **Recent Error Console**",
+                    f"👤 **Account:** {config.get('name')} ({phone})",
+                    "━━━━━━━━━━━━━━━━━━"
+                ]
+                for i, err in enumerate(err_list, 1):
+                    # Show index and formatted error time/message
+                    lines.append(f"{i}. `[{err['timestamp']}]` {err['message']}")
+                lines.append("━━━━━━━━━━━━━━━━━━")
+                lines.append("💡 Type `.error <num>` to see detailed tracebacks.")
+                lines.append("💡 Type `.error clear` to reset the log.")
+                await event.respond("\n".join(lines))
 
         elif text.startswith(".help"):
             await event.respond(
@@ -813,15 +915,17 @@ async def run_user_bot(config):
                 "• `.delay <sec>` — Set message spacing\n"
                 "• `.mode <copy|forward>` — Switch sending style\n"
                 "\n🛰 **Target Groups Management:**\n"
-                "• `.addgroup <url>` — Add target group(s) (comma/space/newline split)\n"
-                "• `.delgroup <url|all>` — Remove group(s) or clear the list\n"
+                "• `.add <url>` (or `.addgroup`) — Add target group(s)\n"
+                "• `.delgroup <url>` — Remove specific group(s)\n"
+                "• `.delall` (or `.delgroup all`) — Clear all target groups\n"
                 "• `.groups` — Show all target groups\n"
                 "• `.join <url>` — Join new groups (bulk support)\n"
                 "• `.check` — Audit send permissions on all groups\n"
                 "\n📊 **System Monitoring & Settings:**\n"
                 "• `.stats` — Display detailed runtime metrics & speed\n"
                 "• `.status` — Display sleek system configuration state\n"
-                "• `.info` | `.night` — Account details and Auto-Night window"
+                "• `.info` | `.night` — Account details and Auto-Night window\n"
+                "• `.error` — Display recent error/failure logs"
             )
 
     async def forward_loop():
@@ -923,9 +1027,11 @@ async def run_user_bot(config):
                             user_state["fail_total"] += 1
                             user_state["current_cycle_fail"] += 1
                         except Exception as e:
-                            log_event(f"Failed {group}: {type(e).__name__}")
-                            user_state["fail_total"] += 1
-                            user_state["current_cycle_fail"] += 1
+                             import traceback
+                             tb_str = traceback.format_exc()
+                             log_event(f"Failed {group}: {type(e).__name__} - {e}", details=tb_str)
+                             user_state["fail_total"] += 1
+                             user_state["current_cycle_fail"] += 1
 
                         # Always sleep the delay between groups (unless custom sleep occurred or it is the last group)
                         if i < len(groups_list) and not custom_sleep_done:
@@ -952,21 +1058,25 @@ async def run_user_bot(config):
 
                     log_event(f"Msg {msg_idx} cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
                     
-                    # Interval delay between different messages
+                    # Interval delay between different messages (with organic Timing Jitter)
                     if msg_idx < len(valid_messages):
                         user_state["status"] = f"Waiting for next msg ⏳"
                         now = _get_now_tz(tz)
-                        user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
+                        sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
+                        user_state["next_msg_at"] = now + timedelta(seconds=sleep_seconds)
                         await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
 
-                # After all messages are processed, wait the cycle delay again before checking for new messages
+                # After all messages are processed, wait the cycle delay again before checking for new messages (with organic Timing Jitter)
                 user_state["status"] = "Idle 😴"
                 now = _get_now_tz(tz)
-                user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
+                sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
+                user_state["next_msg_at"] = now + timedelta(seconds=sleep_seconds)
                 await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
 
             except Exception as e:
-                log_event(f"Error in forward loop: {e}")
+                import traceback
+                tb_str = traceback.format_exc()
+                log_event(f"Error in forward loop: {e}", details=tb_str)
                 await asyncio.sleep(60)
 
 
