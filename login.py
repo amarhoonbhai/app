@@ -60,11 +60,12 @@ from colorama import Fore, Style, init
 # ---------- Init ----------
 init(autoreset=True)
 
-SESSIONS_DIR = "sessions"
-USERS_DIR    = "users"
-USERS_FILE   = "users.json"
-
-AUTONIGHT_FILE = "autonight.json"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
+USERS_DIR    = os.path.join(APP_DIR, "users")
+USERS_FILE   = os.path.join(APP_DIR, "users.json")
+AUTONIGHT_FILE = os.path.join(APP_DIR, "autonight.json")
+PID_FILE = os.path.join(APP_DIR, "runner.pid")
 AUTONIGHT_DEFAULT = {
     "enabled": True,
     "start": "00:00",
@@ -142,6 +143,16 @@ def list_users(users: Dict[str, Any]) -> None:
 
 
 
+def is_runner_running() -> bool:
+    pid_file = PID_FILE
+    if not os.path.exists(pid_file):
+        return False
+    try:
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+    except Exception:
+        return False
+
     if pid <= 0:
         return False
 
@@ -164,7 +175,7 @@ def list_users(users: Dict[str, Any]) -> None:
             return False
 
 def stop_runner():
-    pid_file = "runner.pid"
+    pid_file = PID_FILE
     if not os.path.exists(pid_file):
         print(Fore.YELLOW + "  [!] No PID file found. Engine might not be running.")
         return
@@ -197,9 +208,9 @@ def start_runner_if_needed():
         return
     
     # Remove stale pid file if exists
-    if os.path.exists("runner.pid"):
+    if os.path.exists(PID_FILE):
         try:
-            os.remove("runner.pid")
+            os.remove(PID_FILE)
         except Exception:
             pass
 

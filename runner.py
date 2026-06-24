@@ -271,8 +271,10 @@ def autonight_parse_command(arg: str, cfg: dict) -> Tuple[str, dict]:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-USERS_DIR = "users"
-SESSIONS_DIR = "sessions"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_DIR = os.path.join(APP_DIR, "users")
+SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
+PID_FILE = os.path.join(APP_DIR, "runner.pid")
 clients = {}
 started_phones = set()
 active_bots = {}
@@ -1133,7 +1135,7 @@ async def main():
     os.makedirs(USERS_DIR, exist_ok=True)
     
     # Write PID file
-    pid_file = "runner.pid"
+    pid_file = PID_FILE
     with open(pid_file, "w") as f:
         f.write(str(os.getpid()))
 
@@ -1175,7 +1177,7 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown requested. Exiting.")
         try:
-            if os.path.exists("runner.pid"):
-                os.remove("runner.pid")
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
         except Exception:
             pass
