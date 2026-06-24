@@ -66,6 +66,7 @@ USERS_DIR    = os.path.join(APP_DIR, "users")
 USERS_FILE   = os.path.join(APP_DIR, "users.json")
 AUTONIGHT_FILE = os.path.join(APP_DIR, "autonight.json")
 PID_FILE = os.path.join(APP_DIR, "runner.pid")
+RUNNER_LOG = os.path.join(APP_DIR, "runner.log")
 AUTONIGHT_DEFAULT = {
     "enabled": True,
     "start": "00:00",
@@ -232,7 +233,7 @@ def start_runner_if_needed():
             print(Fore.RED + f"  [!] Failed to start engine: {e}")
     else:
         # Linux: Start in background with log file
-        log_path = os.path.join(app_dir, RUNNER_LOG)
+        log_path = RUNNER_LOG
         with open(log_path, "ab") as logf:
             subprocess.Popen(
                 [python_cmd, runner_path],
