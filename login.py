@@ -90,8 +90,7 @@ def atomic_save_json(path: str, data: Any) -> bool:
         return False
 
 
-RUNNER_CMD = ["python3", "runner.py"]
-RUNNER_LOG = "runner.log"
+
 
 # ---------- Files & Config ----------
 def ensure_dirs():
@@ -142,16 +141,6 @@ def list_users(users: Dict[str, Any]) -> None:
     input(Fore.WHITE + "\n  Press Enter to return to menu...")
 
 
-# ---------- Runner management ----------
-def is_runner_running() -> bool:
-    pid_file = "runner.pid"
-    if not os.path.exists(pid_file):
-        return False
-    try:
-        with open(pid_file, "r") as f:
-            pid = int(f.read().strip())
-    except Exception:
-        return False
 
     if pid <= 0:
         return False
@@ -359,8 +348,6 @@ def login_new_user(users: Dict[str, Any]):
 
     finally:
         client.disconnect()
-    
-    start_runner_if_needed()
 
 def delete_user(users: Dict[str, Any]):
     phone = input("  Phone number to delete: ").strip()
@@ -408,14 +395,13 @@ def start():
     while True:
         users = load_users()
         total_users = len(users)
-        runner_status = f"{Fore.GREEN}RUNNING" if is_runner_running() else f"{Fore.RED}STOPPED"
         
         banner = f"""
 {Fore.CYAN}{Style.BRIGHT}╔══════════════════════════════════════════════════════╗
 ║        {Fore.YELLOW}TELETHON MULTI-USER MANAGER V5 ELITE{Fore.CYAN}          ║
 ║           {Fore.GREEN}Lifetime Premium Access Enabled{Fore.CYAN}            ║
 ╠══════════════════════════════════════════════════════╣
-║  {Fore.WHITE}Registered Sessions: {Fore.YELLOW}{total_users:<2}          {Fore.WHITE}Engine: {runner_status}{Fore.CYAN}  ║
+║  {Fore.WHITE}Registered Sessions: {Fore.YELLOW}{total_users:<2}                             {Fore.CYAN}║
 ╚══════════════════════════════════════════════════════╝{Style.RESET_ALL}"""
 
         print(banner)
@@ -427,8 +413,8 @@ def start():
         print(f"  {Fore.CYAN}4.{Fore.WHITE} View Auto-Night Status")
         print(f"  {Fore.CYAN}5.{Fore.WHITE} Config Auto-Night Mode")
         print(f"  {Fore.CYAN}─" * 25)
-        print(f"  {Fore.CYAN}6.{Fore.WHITE} {Fore.YELLOW}RESTART BACKGROUND ENGINE")
-        print(f"  {Fore.CYAN}7.{Fore.WHITE} {Fore.BLUE}Account Health Verification")
+        print(f"  {Fore.CYAN}6.{Fore.WHITE} {Fore.BLUE}Account Health Verification")
+        print(f"  {Fore.CYAN}7.{Fore.WHITE} {Fore.MAGENTA}Run One-Time Scheduler (Schedule on Telegram)")
         print(f"  {Fore.CYAN}8.{Fore.WHITE} Close Manager")
         
         choice = input(Fore.YELLOW + "\n  ❯ Select an option [1-8]: " + Style.RESET_ALL).strip()
@@ -444,12 +430,14 @@ def start():
         elif choice == '5':
             edit_autonight()
         elif choice == '6':
-            stop_runner()
-            import time as pytime
-            pytime.sleep(1.5)
-            start_runner_if_needed()
-        elif choice == '7':
             check_account_health(users)
+        elif choice == '7':
+            import scheduler
+            import asyncio
+            try:
+                asyncio.run(scheduler.schedule_menu())
+            except Exception as e:
+                print(Fore.RED + f"  [!] Scheduler execution error: {e}")
         elif choice == '8':
             print(Fore.CYAN + "\n  Goodbye!")
             break
