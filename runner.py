@@ -362,23 +362,35 @@ def get_entity_display_name(entity: Any, fallback: str) -> str:
 
 async def check_write_permission(client, entity) -> str:
     try:
-        from telethon.tl.types import Channel, Chat
+        if not entity:
+            return "Unknown Entity"
+        from telethon.tl.types import Channel, Chat, User, ChatForbidden, ChannelForbidden
+        if isinstance(entity, User):
+            return "User Account (Not a Group)"
+        if isinstance(entity, (ChatForbidden, ChannelForbidden)):
+            return "Forbidden Group"
+        if not isinstance(entity, (Channel, Chat)):
+            return f"Non-Group Entity ({type(entity).__name__})"
+
         if isinstance(entity, Channel):
-            if entity.broadcast and not entity.admin_rights:
+            if getattr(entity, 'broadcast', False) and not getattr(entity, 'admin_rights', None):
                 return "Read-Only Channel"
-            if entity.banned_rights and entity.banned_rights.send_messages:
+            b_rights = getattr(entity, 'banned_rights', None)
+            if b_rights and getattr(b_rights, 'send_messages', False):
                 return "Muted (Banned)"
         elif isinstance(entity, Chat):
-            if entity.default_banned_rights and entity.default_banned_rights.send_messages:
+            db_rights = getattr(entity, 'default_banned_rights', None)
+            if db_rights and getattr(db_rights, 'send_messages', False):
                 return "Muted (Default)"
         
         try:
             permissions = await client.get_permissions(entity)
-            if permissions.is_banned:
+            if getattr(permissions, 'is_banned', False):
                 return "Banned"
             if hasattr(permissions, 'send_messages') and not permissions.send_messages:
                 return "Muted"
-        except Exception:
+        except (AttributeError, TypeError, Exception) as pe:
+            logger.warning(f"Permissions check warning for entity: {pe}")
             pass
         return "Healthy"
     except Exception as e:
