@@ -343,6 +343,23 @@ def _seconds_until_quiet_start(cfg: dict = None) -> int:
         start_dt = start_dt + timedelta(days=1)
     return int((start_dt - now).total_seconds())
 
+def get_entity_display_name(entity: Any, fallback: str) -> str:
+    """Safely returns entity title, name, or username without raising AttributeError."""
+    if not entity or isinstance(entity, str):
+        return fallback
+    if getattr(entity, 'title', None):
+        return entity.title
+    first_name = getattr(entity, 'first_name', None)
+    if first_name:
+        last_name = getattr(entity, 'last_name', None) or ""
+        name = f"{first_name} {last_name}".strip()
+        if name:
+            return name
+    username = getattr(entity, 'username', None)
+    if username:
+        return f"@{username}"
+    return fallback
+
 async def check_write_permission(client, entity) -> str:
     try:
         from telethon.tl.types import Channel, Chat
@@ -932,8 +949,10 @@ async def run_user_bot(config):
             for idx, group in enumerate(groups_to_check, 1):
                 try:
                     target_entity = await resolve_group_entity(client, group)
+                    display_name = get_entity_display_name(target_entity, group)
+
                     if isinstance(target_entity, str):
-                        results.append(f"{idx}. 🗑️ **{group}** | Access Denied (Auto-Removed)")
+                        results.append(f"{idx}. 🗑️ **{display_name}** | Access Denied (Auto-Removed)")
                         if group in config["groups"]:
                             config["groups"].remove(group)
                             await asyncio.to_thread(db.update_user_config, phone, groups=config["groups"])
@@ -941,14 +960,18 @@ async def run_user_bot(config):
                     
                     status = await check_write_permission(client, target_entity)
                     if status == "Healthy":
-                        results.append(f"{idx}. ✅ **{target_entity.title}** | Healthy")
+                        results.append(f"{idx}. ✅ **{display_name}** | Healthy")
                     else:
-                        results.append(f"{idx}. 🗑️ **{target_entity.title}** | {status} (Auto-Removed)")
+                        results.append(f"{idx}. 🗑️ **{display_name}** | {status} (Auto-Removed)")
                         if group in config["groups"]:
                             config["groups"].remove(group)
                             await asyncio.to_thread(db.update_user_config, phone, groups=config["groups"])
                 except Exception as e:
-                    results.append(f"{idx}. ❓ **{group}** | Error: {type(e).__name__}")
+                    logger.error(f"Check error on {group}: {e}")
+                    results.append(f"{idx}. 🗑️ **{group}** | Error: {type(e).__name__} (Auto-Removed)")
+                    if group in config["groups"]:
+                        config["groups"].remove(group)
+                        await asyncio.to_thread(db.update_user_config, phone, groups=config["groups"])
             
             # Delete progress message safely
             try:
