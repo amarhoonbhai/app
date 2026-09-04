@@ -54,6 +54,12 @@ def init_db():
                 value TEXT NOT NULL
             );
         """)
+
+        # Migration: Ensure proxy column exists on users table
+        cursor.execute("PRAGMA table_info(users);")
+        cols = [c[1] for c in cursor.fetchall()]
+        if "proxy" not in cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN proxy TEXT DEFAULT NULL;")
         
         conn.commit()
     finally:
@@ -228,12 +234,13 @@ def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry FROM users WHERE phone = ?",
+            "SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy FROM users WHERE phone = ?",
             (phone,)
         )
         row = cursor.fetchone()
         if not row:
             return None
+        proxy_val = json.loads(row["proxy"]) if row["proxy"] else None
         return {
             "phone": row["phone"],
             "name": row["name"],
@@ -242,7 +249,8 @@ def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
             "cycle_delay_min": row["cycle_delay_min"],
             "msg_delay_sec": row["msg_delay_sec"],
             "groups": json.loads(row["groups"] or "[]"),
-            "plan_expiry": row["plan_expiry"]
+            "plan_expiry": row["plan_expiry"],
+            "proxy": proxy_val
         }
     finally:
         conn.close()
@@ -255,8 +263,8 @@ def update_user_config(phone: str, **kwargs):
         params = []
         for key, val in kwargs.items():
             if val is not None:
-                if key == "groups":
-                    val = json.dumps(val)
+                if key in ("groups", "proxy"):
+                    val = json.dumps(val) if val is not None else None
                 set_clauses.append(f"{key} = ?")
                 params.append(val)
         if not set_clauses:
@@ -275,7 +283,7 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, updated_at FROM users")
+        cursor.execute("SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy, updated_at FROM users")
         rows = cursor.fetchall()
         return [
             {
@@ -287,10 +295,39 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
                 "msg_delay_sec": r["msg_delay_sec"],
                 "groups": json.loads(r["groups"] or "[]"),
                 "plan_expiry": r["plan_expiry"],
+                "proxy": json.loads(r["proxy"]) if r["proxy"] else None,
                 "updated_at": r["updated_at"]
             }
             for r in rows
         ]
+    finally:
+        conn.close()
+
+def get_admin_id() -> Optional[int]:
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = 'admin_id'")
+        row = cursor.fetchone()
+        if row and row["value"]:
+            try:
+                return int(row["value"])
+            except ValueError:
+                return None
+        return None
+    finally:
+        conn.close()
+
+def save_admin_id(admin_id: Optional[int]):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        val = str(admin_id) if admin_id is not None else ""
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_id', ?)",
+            (val,)
+        )
+        conn.commit()
     finally:
         conn.close()
 

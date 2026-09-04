@@ -57,7 +57,10 @@ from telethon.errors import (
     RPCError, 
     FloodWaitError, 
     ChatWriteForbiddenError,
-    SlowModeWaitError
+    SlowModeWaitError,
+    UserBannedInChannelError,
+    ChannelPrivateError,
+    ChatAdminRequiredError
 )
 import telethon.utils as tel_utils
 from colorama import Fore, Style, init
@@ -76,8 +79,53 @@ DEFAULT_AUTONIGHT = {
     "tz": "Asia/Kolkata"
 }
 
+def parse_spintax(text: str) -> str:
+    """
+    Parses Spintax pattern like '{Hello|Hi|Hey} {friend|there}!' recursively.
+    """
+    if not text:
+        return text
+    pattern = re.compile(r'\{([^{}]+)\}')
+    while True:
+        match = pattern.search(text)
+        if not match:
+            break
+        options = match.group(1).split('|')
+        choice = random.choice(options)
+        text = text[:match.start()] + choice + text[match.end():]
+    return text
 
+def get_telethon_proxy(proxy_cfg: Optional[dict]):
+    """
+    Constructs Telethon-compatible proxy configuration tuple.
+    """
+    if not proxy_cfg or not isinstance(proxy_cfg, dict):
+        return None
+    ptype = str(proxy_cfg.get("proxy_type", "socks5")).lower()
+    addr = proxy_cfg.get("addr") or proxy_cfg.get("host")
+    port = proxy_cfg.get("port")
+    if not addr or not port:
+        return None
 
+    try:
+        import socks
+        socks_map = {
+            "socks5": socks.SOCKS5,
+            "socks4": socks.SOCKS4,
+            "http": socks.HTTP
+        }
+        stype = socks_map.get(ptype, socks.SOCKS5)
+        return (
+            stype,
+            str(addr),
+            int(port),
+            True,
+            proxy_cfg.get("username") or None,
+            proxy_cfg.get("password") or None
+        )
+    except ImportError:
+        logger.warning("PySocks not installed. Proxy ignored.")
+        return None
 
 def _load_autonight() -> dict:
     return db.get_autonight_settings()
@@ -319,11 +367,92 @@ async def check_write_permission(client, entity) -> str:
     except Exception as e:
         return f"Access Denied: {type(e).__name__}"
 
+STOP_WORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "group", "chat", "official",
+    "link", "https", "http", "telegram", "tme", "channel", "join", "admin", "owner",
+    "public", "free", "main", "new", "real", "best", "top", "all", "get", "sub"
+}
+
+def extract_message_keywords(text: str) -> set:
+    """Extracts all significant topic keywords and hashtags from message text."""
+    if not text:
+        return set()
+    words = re.findall(r'\b[a-zA-Z0-9_]{3,}\b', text.lower())
+    keywords = {w for w in words if w not in STOP_WORDS and not w.isdigit()}
+    return keywords
+
+def get_group_search_keywords(group_url: str, target_entity: Any) -> set:
+    """Extracts significant keywords from group title, username, and URL."""
+    keywords = set()
+    clean_url = group_url.lower().strip().rstrip('/')
+    url_parts = re.split(r'[/_.-]+', clean_url)
+    for p in url_parts:
+        if len(p) >= 3 and p not in STOP_WORDS and not p.startswith("http") and not p.isdigit():
+            keywords.add(p)
+
+    if hasattr(target_entity, 'title') and target_entity.title:
+        title_parts = re.split(r'[\s/_.-]+', target_entity.title.lower())
+        for p in title_parts:
+            p_clean = re.sub(r'\W+', '', p)
+            if len(p_clean) >= 3 and p_clean not in STOP_WORDS and not p_clean.isdigit():
+                keywords.add(p_clean)
+
+    if hasattr(target_entity, 'username') and target_entity.username:
+        u_parts = re.split(r'[/_.-]+', target_entity.username.lower())
+        for p in u_parts:
+            if len(p) >= 3 and p not in STOP_WORDS and not p.isdigit():
+                keywords.add(p)
+
+    return keywords
+
+def find_smart_matched_message(group_url: str, target_entity: Any, valid_messages: List[Any]) -> Optional[Any]:
+    """
+    Finds message in valid_messages whose full text keywords best match group keywords.
+    Returns None if no keyword match found (score == 0).
+    """
+    group_kw = get_group_search_keywords(group_url, target_entity)
+    if not group_kw:
+        return None
+
+    best_msg = None
+    best_score = 0
+
+    for msg in valid_messages:
+        msg_text = msg.text or ""
+        msg_kw = extract_message_keywords(msg_text)
+        if not msg_kw:
+            continue
+
+        # Score matching keywords
+        overlap = group_kw.intersection(msg_kw)
+        score = len(overlap)
+        
+        # Substring keyword check boost
+        if score == 0:
+            for g_word in group_kw:
+                for m_word in msg_kw:
+                    if len(g_word) >= 4 and len(m_word) >= 4:
+                        if g_word in m_word or m_word in g_word:
+                            score += 1
+                            
+        if score > best_score:
+            best_score = score
+            best_msg = msg
+
+    return best_msg
+
+entity_cache = {} # clean_link -> (entity, timestamp)
+
 async def resolve_group_entity(client, group_url: str):
     """
-    Resolves a group URL (public or private invite link) to a Telethon entity.
+    Resolves a group URL (public or private invite link) to a Telethon entity with caching.
     """
     clean_link = group_url.strip().rstrip('/')
+    now_ts = time.time()
+    if clean_link in entity_cache:
+        ent, cached_at = entity_cache[clean_link]
+        if now_ts - cached_at < 300:
+            return ent
     
     # Handle private invite links
     if "t.me/+" in clean_link or "t.me/joinchat/" in clean_link:
@@ -384,8 +513,8 @@ async def run_user_bot(config):
     delay = config.get("msg_delay_sec", 20)
     cycle = config.get("cycle_delay_min", 7)
 
-    # Load persistent errors
-    loaded_errors = db.get_errors(phone)
+    # Load persistent errors asynchronously
+    loaded_errors = await asyncio.to_thread(db.get_errors, phone)
 
     user_state = {
         "delay": delay,   # seconds between forwards
@@ -399,8 +528,17 @@ async def run_user_bot(config):
         "status": "Idle 😴",
         "logs": [],
         "errors": loaded_errors,
+        "msg_seq": 0,
         "start_time": _get_now_tz(reload_autonight_cfg().get("tz", DEFAULT_AUTONIGHT["tz"]))
     }
+
+    async def remove_denied_group(group_url: str):
+        groups = config.get("groups", [])
+        if group_url in groups:
+            groups.remove(group_url)
+            config["groups"] = groups
+            await asyncio.to_thread(db.update_user_config, phone, groups=groups)
+            log_event(f"🗑️ Auto-removed access denied group: {group_url}")
 
     active_bots[phone] = {
         "client": None,
@@ -438,11 +576,17 @@ async def run_user_bot(config):
             user_state["logs"].pop(0)
             
         if is_err:
-            db.log_error(phone, ts, msg, details)
-            user_state["errors"] = db.get_errors(phone)
+            def _async_err_log():
+                db.log_error(phone, ts, msg, details)
+                user_state["errors"] = db.get_errors(phone)
+            asyncio.create_task(asyncio.to_thread(_async_err_log))
         logger.info(f"[{phone}] {msg}")
 
-    client = TelegramClient(session_path, api_id, api_hash)
+    proxy = get_telethon_proxy(config.get("proxy"))
+    if proxy:
+        logger.info(f"[{phone}] Connecting using proxy: {config['proxy'].get('addr')}:{config['proxy'].get('port')}")
+
+    client = TelegramClient(session_path, api_id, api_hash, proxy=proxy)
     active_bots[phone]["client"] = client
     try:
         await client.connect()
@@ -476,9 +620,15 @@ async def run_user_bot(config):
                 log_event(f"Command Error: {type(e).__name__} - {e}", details=tb_str)
         return wrapper
 
-    @client.on(events.NewMessage(outgoing=True))
+    @client.on(events.NewMessage)
     @command_wrapper
     async def command_handler(event):
+        admin_id = await asyncio.to_thread(db.get_admin_id)
+        is_owner = event.out
+        is_admin = (admin_id is not None) and (event.sender_id == admin_id)
+        if not (is_owner or is_admin):
+            return
+
         text = (event.raw_text or "").strip()
         if not text.startswith("."):
             return
@@ -778,18 +928,25 @@ async def run_user_bot(config):
             
             progress_msg = await event.respond(f"🔍 Auditing permissions on {len(groups_list)} groups...")
             results = []
-            for idx, group in enumerate(groups_list, 1):
+            groups_to_check = list(groups_list)
+            for idx, group in enumerate(groups_to_check, 1):
                 try:
                     target_entity = await resolve_group_entity(client, group)
                     if isinstance(target_entity, str):
-                        results.append(f"{idx}. 🚫 **{group}** | Access Denied")
+                        results.append(f"{idx}. 🗑️ **{group}** | Access Denied (Auto-Removed)")
+                        if group in config["groups"]:
+                            config["groups"].remove(group)
+                            await asyncio.to_thread(db.update_user_config, phone, groups=config["groups"])
                         continue
                     
                     status = await check_write_permission(client, target_entity)
                     if status == "Healthy":
                         results.append(f"{idx}. ✅ **{target_entity.title}** | Healthy")
                     else:
-                        results.append(f"{idx}. ⚠️ **{target_entity.title}** | {status}")
+                        results.append(f"{idx}. 🗑️ **{target_entity.title}** | {status} (Auto-Removed)")
+                        if group in config["groups"]:
+                            config["groups"].remove(group)
+                            await asyncio.to_thread(db.update_user_config, phone, groups=config["groups"])
                 except Exception as e:
                     results.append(f"{idx}. ❓ **{group}** | Error: {type(e).__name__}")
             
@@ -812,6 +969,12 @@ async def run_user_bot(config):
                     current_len += len(line) + 1
             if current_chunk:
                 await event.respond("\n".join(current_chunk))
+
+        elif text.startswith(".smart"):
+            curr = user_state.get("smart_ad_mode", True)
+            user_state["smart_ad_mode"] = not curr
+            status_text = "ENABLED 🎯 (Prioritizes group topic tag matches)" if user_state["smart_ad_mode"] else "DISABLED 🔄 (Standard sequential flow)"
+            await event.respond(f"🧠 Smart Ad Sender is now **{status_text}**")
 
         elif text.startswith(".errors") or text.startswith(".error"):
             arg = text[len(".error"):].strip() if text.startswith(".error") else text[len(".errors"):].strip()
@@ -945,17 +1108,56 @@ async def run_user_bot(config):
                         
                         try:
                             target_entity = await resolve_group_entity(client, group)
+                            if isinstance(target_entity, str):
+                                log_event(f"Cannot resolve {group}. Auto-removing group.")
+                                user_state["fail_total"] += 1
+                                user_state["current_cycle_fail"] += 1
+                                await remove_denied_group(group)
+                                continue
+
+                            # 🎯 Smart Ad Sender: Select message matching group topic tags, or fall back to default flow
+                            send_msg = msg
+                            if user_state.get("smart_ad_mode", True):
+                                matched_msg = find_smart_matched_message(group, target_entity, valid_messages)
+                                if matched_msg:
+                                    send_msg = matched_msg
+                                    log_event(f"🎯 Smart Ad Tag Match for {group}")
+
                             if user_state["use_copy"]:
-                                # 🌈 Copy Mode
-                                caption = msg.text or ""
+                                # 🌈 Copy Mode (with sequential message_id tag & entity formatting)
+                                user_state["msg_seq"] += 1
+                                seq_num = user_state["msg_seq"]
+                                base_text = (send_msg.text or "").strip()
+                                seq_tag = f"message_id = #{seq_num}"
+                                caption = f"{base_text}\n\n{seq_tag}" if base_text else seq_tag
+
                                 from telethon.tl.types import MessageMediaWebPage
-                                if msg.media and not isinstance(msg.media, MessageMediaWebPage):
-                                    await client.send_file(target_entity, msg.media, caption=caption)
-                                else:
-                                    await client.send_message(target_entity, caption)
+                                has_media = send_msg.media and not isinstance(send_msg.media, MessageMediaWebPage)
+
+                                # Send with transient retry loop
+                                for retry_attempt in range(3):
+                                    try:
+                                        if has_media:
+                                            await client.send_file(target_entity, send_msg.media, caption=caption, formatting_entities=send_msg.entities)
+                                        else:
+                                            await client.send_message(target_entity, caption, formatting_entities=send_msg.entities)
+                                        break
+                                    except (ConnectionError, TimeoutError, asyncio.TimeoutError) as ne:
+                                        if retry_attempt < 2:
+                                            await asyncio.sleep(1.5)
+                                        else:
+                                            raise ne
                             else:
-                                # 🔄 Forward Mode
-                                await client.forward_messages(target_entity, msg)
+                                # 🔄 Forward Mode with transient retry loop
+                                for retry_attempt in range(3):
+                                    try:
+                                        await client.forward_messages(target_entity, send_msg)
+                                        break
+                                    except (ConnectionError, TimeoutError, asyncio.TimeoutError) as ne:
+                                        if retry_attempt < 2:
+                                            await asyncio.sleep(1.5)
+                                        else:
+                                            raise ne
 
                             user_state["success_total"] += 1
                             user_state["current_cycle_success"] += 1
@@ -978,16 +1180,20 @@ async def run_user_bot(config):
                              user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 2)
                              await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
                              custom_sleep_done = True
-                        except ChatWriteForbiddenError:
-                            log_event(f"No permission in {group}")
+                        except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError, ChatAdminRequiredError) as e:
+                            log_event(f"Access denied in {group} ({type(e).__name__}). Auto-removing group.")
                             user_state["fail_total"] += 1
                             user_state["current_cycle_fail"] += 1
+                            await remove_denied_group(group)
                         except Exception as e:
                              import traceback
                              tb_str = traceback.format_exc()
                              log_event(f"Failed {group}: {type(e).__name__} - {e}", details=tb_str)
                              user_state["fail_total"] += 1
                              user_state["current_cycle_fail"] += 1
+                             err_msg = str(e).lower()
+                             if any(k in err_msg for k in ["forbidden", "banned", "write permission", "read-only", "admin required", "private"]):
+                                 await remove_denied_group(group)
 
                         # Always sleep the delay between groups (unless custom sleep occurred or it is the last group)
                         if i < len(groups_list) and not custom_sleep_done:
@@ -1055,7 +1261,7 @@ async def user_loader():
     config_mtimes = {} # phone -> last_updated_at
     while True:
         try:
-            configs = db.get_all_user_configs()
+            configs = await asyncio.to_thread(db.get_all_user_configs)
             for config in configs:
                 phone = config.get("phone")
                 updated_at = config.get("updated_at", 0.0)
@@ -1079,8 +1285,25 @@ async def user_loader():
             logger.error(f"Error loading user configs from database: {e}")
         await asyncio.sleep(10) # Check every 10s for faster configuration updates
 
+async def auto_restart_watchdog():
+    start_time = time.time()
+    max_uptime = 30 * 3600 # 30 hours from startup
+    while True:
+        await asyncio.sleep(60)
+        elapsed = time.time() - start_time
+        if elapsed >= max_uptime:
+            logger.info("30-hour process uptime reached. Auto-restarting runner process...")
+            print(Fore.YELLOW + "\n[🔁] 30-hour process uptime reached. Auto-restarting engine...")
+            if os.path.exists(PID_FILE):
+                try:
+                    os.remove(PID_FILE)
+                except Exception:
+                    pass
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
 async def main():
     os.makedirs(SESSIONS_DIR, exist_ok=True)
+    asyncio.create_task(auto_restart_watchdog())
     
     # Write PID file
     pid_file = PID_FILE

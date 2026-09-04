@@ -6,7 +6,8 @@ import subprocess
 # Auto-install dependencies if missing
 required_packages = {
     "telethon": "telethon==1.34.0",
-    "colorama": "colorama==0.4.6"
+    "colorama": "colorama==0.4.6",
+    "socks": "PySocks==1.7.1"
 }
 
 missing_packages = []
@@ -401,12 +402,75 @@ def check_account_health(users: Dict[str, Any]):
     print(Fore.CYAN + "  " + "─" * 40)
     input(Fore.WHITE + "\n  Scan complete. Press Enter...")
 
+def configure_proxy(users: Dict[str, Any]):
+    if not users:
+        print(Fore.YELLOW + "  [!] No users registered yet.")
+        return
+    print(Fore.CYAN + "\n  [ CONFIGURE ACCOUNT PROXY ]")
+    user_list = list(users.items())
+    for i, (phone, data) in enumerate(user_list, 1):
+        print(f"  {i}. {data.get('name')} ({phone})")
+    choice = input("\n  Select account number (or 0 to cancel): ").strip()
+    if not choice.isdigit() or int(choice) < 1 or int(choice) > len(user_list):
+        return
+    
+    phone, udata = user_list[int(choice) - 1]
+    cfg = db.get_user_config(phone) or {}
+    curr_proxy = cfg.get("proxy") or {}
+    print(f"\n  Configuring proxy for {udata.get('name')} ({phone})")
+    if curr_proxy:
+        print(f"  Current Proxy: {curr_proxy.get('proxy_type', 'socks5')}://{curr_proxy.get('addr')}:{curr_proxy.get('port')}")
+    else:
+        print("  Current Proxy: None (Direct Connection)")
+    
+    enable = input("  Enable proxy for this account? [y/n]: ").strip().lower()
+    if enable not in ('y', 'yes'):
+        db.update_user_config(phone, proxy=None)
+        print(Fore.GREEN + "  [✔] Proxy disabled for account.")
+        return
+
+    ptype = input("  Proxy type [socks5/socks4/http] (default: socks5): ").strip().lower() or "socks5"
+    addr = input("  Proxy Host/IP: ").strip()
+    port = input("  Proxy Port: ").strip()
+    user = input("  Username (optional): ").strip()
+    password = input("  Password (optional): ").strip()
+
+    if not addr or not port.isdigit():
+        print(Fore.RED + "  [!] Invalid Host or Port.")
+        return
+
+    proxy_data = {
+        "proxy_type": ptype,
+        "addr": addr,
+        "port": int(port),
+        "username": user or None,
+        "password": password or None
+    }
+    db.update_user_config(phone, proxy=proxy_data)
+    print(Fore.GREEN + f"  [✔] Proxy ({ptype}://{addr}:{port}) configured successfully for {phone}.")
+
+def configure_admin_id():
+    curr = db.get_admin_id()
+    print(Fore.CYAN + "\n  [ REMOTE ADMIN TELEGRAM ID ]")
+    print(Fore.WHITE + f"  Current Admin ID: {Fore.YELLOW}{curr or 'Not Set'}")
+    new_id = input("  Enter Telegram User ID for remote admin commands (or press Enter to clear): ").strip()
+    if not new_id:
+        db.save_admin_id(None)
+        print(Fore.YELLOW + "  [!] Remote Admin ID cleared.")
+    elif new_id.isdigit():
+        db.save_admin_id(int(new_id))
+        print(Fore.GREEN + f"  [✔] Remote Admin ID set to {new_id}.")
+    else:
+        print(Fore.RED + "  [!] User ID must be numeric.")
+
 # ---------- Main Menu ----------
 def start():
     ensure_dirs()
     while True:
         users = load_users()
         total_users = len(users)
+        admin_id = db.get_admin_id()
+        admin_str = str(admin_id) if admin_id else "Not Set"
         
         banner = f"""
 {Fore.CYAN}{Style.BRIGHT}╔══════════════════════════════════════════════════════╗
@@ -414,6 +478,7 @@ def start():
 ║           {Fore.GREEN}Lifetime Premium Access Enabled{Fore.CYAN}            ║
 ╠══════════════════════════════════════════════════════╣
 ║  {Fore.WHITE}Registered Sessions: {Fore.YELLOW}{total_users:<2}                             {Fore.CYAN}║
+║  {Fore.WHITE}Remote Admin ID:     {Fore.YELLOW}{admin_str:<15}                {Fore.CYAN}║
 ╚══════════════════════════════════════════════════════╝{Style.RESET_ALL}"""
 
         print(banner)
@@ -427,9 +492,11 @@ def start():
         print(f"  {Fore.CYAN}─" * 25)
         print(f"  {Fore.CYAN}6.{Fore.WHITE} {Fore.YELLOW}RESTART BACKGROUND ENGINE")
         print(f"  {Fore.CYAN}7.{Fore.WHITE} {Fore.BLUE}Account Health Verification")
-        print(f"  {Fore.CYAN}8.{Fore.WHITE} Close Manager")
+        print(f"  {Fore.CYAN}8.{Fore.WHITE} {Fore.MAGENTA}Configure Account Proxy")
+        print(f"  {Fore.CYAN}9.{Fore.WHITE} Set Remote Admin Telegram ID")
+        print(f"  {Fore.CYAN}10.{Fore.WHITE} Close Manager")
         
-        choice = input(Fore.YELLOW + "\n  ❯ Select an option [1-8]: " + Style.RESET_ALL).strip()
+        choice = input(Fore.YELLOW + "\n  ❯ Select an option [1-10]: " + Style.RESET_ALL).strip()
 
         if choice == '1':
             list_users(users)
@@ -449,6 +516,10 @@ def start():
         elif choice == '7':
             check_account_health(users)
         elif choice == '8':
+            configure_proxy(users)
+        elif choice == '9':
+            configure_admin_id()
+        elif choice == '10':
             print(Fore.CYAN + "\n  Goodbye!")
             break
         else:
