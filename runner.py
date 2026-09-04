@@ -1215,20 +1215,13 @@ async def run_user_bot(config):
                              user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 2)
                              await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
                              custom_sleep_done = True
-                        except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError, ChatAdminRequiredError) as e:
-                            log_event(f"Access denied in {group} ({type(e).__name__}). Auto-removing group.")
-                            user_state["fail_total"] += 1
-                            user_state["current_cycle_fail"] += 1
-                            await remove_denied_group(group)
                         except Exception as e:
                              import traceback
                              tb_str = traceback.format_exc()
-                             log_event(f"Failed {group}: {type(e).__name__} - {e}", details=tb_str)
+                             log_event(f"Unable to send message to {group} ({type(e).__name__}: {e}). Auto-removing group.", details=tb_str)
                              user_state["fail_total"] += 1
                              user_state["current_cycle_fail"] += 1
-                             err_msg = str(e).lower()
-                             if any(k in err_msg for k in ["forbidden", "banned", "write permission", "read-only", "admin required", "private"]):
-                                 await remove_denied_group(group)
+                             await remove_denied_group(group)
 
                         # Always sleep the delay between groups (unless custom sleep occurred or it is the last group)
                         if i < len(groups_list) and not custom_sleep_done:
