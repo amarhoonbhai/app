@@ -396,7 +396,10 @@ async def check_write_permission(client, entity) -> str:
     try:
         if not entity:
             return "Unknown Entity"
+        if isinstance(entity, str):
+            return "Access Denied"
         from telethon.tl.types import Channel, Chat, User, ChatForbidden, ChannelForbidden
+        from datetime import datetime, timezone
         if isinstance(entity, User):
             return "User Account (Not a Group)"
         if isinstance(entity, (ChatForbidden, ChannelForbidden)):
@@ -409,39 +412,48 @@ async def check_write_permission(client, entity) -> str:
                 return "Not Joined"
             if getattr(entity, 'broadcast', False) and not getattr(entity, 'admin_rights', None):
                 return "Read-Only Channel"
-            b_rights = getattr(entity, 'banned_rights', None)
-            if b_rights and getattr(b_rights, 'send_messages', False):
-                return "Muted (Banned)"
-            d_rights = getattr(entity, 'default_banned_rights', None)
-            if d_rights and getattr(d_rights, 'send_messages', False) and not getattr(entity, 'admin_rights', None):
-                return "Send Messages Disabled"
         elif isinstance(entity, Chat):
             if getattr(entity, 'deactivated', False):
                 return "Group Deactivated"
             if getattr(entity, 'left', False):
                 return "Not Joined"
-            db_rights = getattr(entity, 'default_banned_rights', None)
-            if db_rights and getattr(db_rights, 'send_messages', False):
-                return "Muted (Default)"
 
+        # Query user-specific permissions for 'me'
         if client:
             try:
-                permissions = await client.get_permissions(entity)
+                permissions = await client.get_permissions(entity, 'me')
                 if permissions:
-                    try:
-                        if getattr(permissions, 'is_banned', False):
-                            return "Banned"
-                    except Exception:
-                        pass
-                    try:
-                        sm = getattr(permissions, 'send_messages', None)
-                        if sm is False:
-                            return "Muted"
-                    except Exception:
-                        pass
+                    if getattr(permissions, 'is_banned', False):
+                        return "Banned"
+                    if getattr(permissions, 'has_left', False):
+                        return "Not Joined"
+
+                    part = getattr(permissions, 'participant', None)
+                    if part:
+                        banned_rights = getattr(part, 'banned_rights', None)
+                        if banned_rights:
+                            send_msgs = getattr(banned_rights, 'send_messages', False)
+                            until_date = getattr(banned_rights, 'until_date', None)
+                            if send_msgs:
+                                now = datetime.now(timezone.utc)
+                                if until_date:
+                                    if isinstance(until_date, (int, float)):
+                                        if 0 < until_date <= now.timestamp():
+                                            send_msgs = False
+                                    elif hasattr(until_date, 'timestamp'):
+                                        if until_date <= now:
+                                            send_msgs = False
+                                if send_msgs:
+                                    return "Muted"
+
+                    # If user is admin, creator, or regular member with default permissions, they can send!
+                    if getattr(permissions, 'is_admin', False) or getattr(permissions, 'is_creator', False) or getattr(permissions, 'has_default_permissions', False):
+                        return "Healthy"
             except Exception as pe:
-                logger.debug(f"Permissions check note for entity: {pe}")
-                pass
+                logger.debug(f"Permissions check for 'me' note: {pe}")
+                err_str = str(pe).lower()
+                if "not participant" in err_str or "usernotparticipant" in err_str:
+                    return "Not Joined"
 
         return "Healthy"
     except Exception as e:
