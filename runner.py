@@ -302,8 +302,8 @@ active_bots = {}
 
 def extract_and_normalize_links(text: str) -> List[str]:
     """
-    Extracts and normalizes Telegram group links or usernames from a string.
-    Handles spaces, commas, and newlines. Normalizes '@username' and 't.me/...'
+    Extracts and normalizes Telegram group links, usernames, or numeric Chat IDs from a string.
+    Handles spaces, commas, and newlines. Normalizes '@username', 't.me/...', and '-100...' / '123456...'.
     """
     tokens = re.split(r'[\s,\n]+', text)
     links = []
@@ -318,6 +318,8 @@ def extract_and_normalize_links(text: str) -> List[str]:
         elif token.startswith('telegram.me/'):
             links.append(f"https://{token}")
         elif re.match(r'^https?://(?:t\.me|telegram\.me)/\S+$', token):
+            links.append(token)
+        elif re.match(r'^-?\d+$', token):
             links.append(token)
     return links
 
@@ -571,10 +573,17 @@ async def resolve_group_entity(client, group_url: str, config: dict = None, phon
         if isinstance(gmap, dict) and clean_link in gmap:
             channel_id = gmap[clean_link]
 
-    if not channel_id and "/c/" in clean_link:
-        cid_part = clean_link.split("/c/")[-1].split("/")[0]
-        if cid_part.isdigit():
-            channel_id = int(cid_part)
+    if not channel_id:
+        if clean_link.startswith("-100"):
+            channel_id = int(clean_link[4:])
+        elif clean_link.startswith("-"):
+            channel_id = int(clean_link[1:])
+        elif clean_link.isdigit():
+            channel_id = int(clean_link)
+        elif "/c/" in clean_link:
+            cid_part = clean_link.split("/c/")[-1].split("/")[0]
+            if cid_part.isdigit():
+                channel_id = int(cid_part)
 
     if channel_id:
         resolved_by_id = None
@@ -964,7 +973,8 @@ async def run_user_bot(config):
                             "title": name,
                             "link": link,
                             "username": username,
-                            "entity": ent
+                            "entity": ent,
+                            "id": getattr(ent, 'id', None)
                         })
 
                 if not fetched:
@@ -980,7 +990,8 @@ async def run_user_bot(config):
                 ]
                 for idx, item in enumerate(fetched, 1):
                     tag_str = f" (@{item['username']})" if item['username'] else f" ({item['link']})"
-                    lines.append(f"{idx}. 👥 **{item['title']}**{tag_str}")
+                    id_str = f" `[ID: {item['id']}]`" if item.get('id') else ""
+                    lines.append(f"{idx}. 👥 **{item['title']}**{tag_str}{id_str}")
 
                 lines.append("━━━━━━━━━━━━━━━━━━")
                 lines.append("💡 **Option 1**: `.addnum 1,3,5` or `.addnum 1-5` or `.addnum all` (Add via sequence numbers)")
@@ -1142,12 +1153,18 @@ async def run_user_bot(config):
 
         elif text.startswith(".groups"):
             groups_list = _get_config_groups(config)
+            gmap = config.get("group_map", {})
+            if not isinstance(gmap, dict):
+                gmap = {}
             if not groups_list:
                 await event.respond("📋 No groups configured.")
             else:
-                lines = [f"❀ Groups ({len(groups_list)}):"]
+                lines = [f"❀ Target Groups ({len(groups_list)}):", "━━━━━━━━━━━━━━━━━━"]
                 for idx, g in enumerate(groups_list, 1):
-                    lines.append(f"{idx}. {g}")
+                    clean_g = g.strip().rstrip('/')
+                    cid = gmap.get(clean_g) or gmap.get(g)
+                    id_tag = f" `[ID: {cid}]`" if cid else ""
+                    lines.append(f"{idx}. **{g}**{id_tag}")
                 
                 # Chunk sending to avoid Telegram MessageTooLongError
                 current_chunk = []
