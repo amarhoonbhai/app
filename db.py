@@ -357,7 +357,6 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
         return res
     finally:
         conn.close()
-        conn.close()
 
 def get_admin_id() -> Optional[int]:
     conn = get_db()

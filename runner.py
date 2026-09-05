@@ -586,10 +586,11 @@ async def resolve_group_entity(client, group_url: str, config: dict = None, phon
                 channel_id = int(cid_part)
 
     if channel_id:
+        cid_clean = int(str(channel_id).replace("-100", "").replace("-", ""))
         resolved_by_id = None
         try:
             from telethon.tl.types import PeerChannel
-            resolved_by_id = await client.get_entity(PeerChannel(channel_id))
+            resolved_by_id = await client.get_entity(PeerChannel(cid_clean))
         except Exception:
             try:
                 resolved_by_id = await client.get_entity(channel_id)
@@ -601,7 +602,7 @@ async def resolve_group_entity(client, group_url: str, config: dict = None, phon
                 dialogs = await client.get_dialogs()
                 for d in dialogs:
                     d_ent = d.entity
-                    if hasattr(d_ent, 'id') and d_ent.id == channel_id:
+                    if hasattr(d_ent, 'id') and getattr(d_ent, 'id', None) in (channel_id, cid_clean):
                         resolved_by_id = d_ent
                         break
             except Exception as e:
@@ -766,6 +767,7 @@ async def run_user_bot(config):
 
     async def auto_populate_chat_ids():
         try:
+            from telethon.tl.types import Channel, Chat
             dialogs = await client.get_dialogs()
             gmap = config.get("group_map", {})
             if not isinstance(gmap, dict):
@@ -773,7 +775,7 @@ async def run_user_bot(config):
             updated = False
             for d in dialogs:
                 ent = d.entity
-                if hasattr(ent, 'id'):
+                if isinstance(ent, (Channel, Chat)) and hasattr(ent, 'id'):
                     cid = ent.id
                     username = getattr(ent, 'username', None)
                     if username:
