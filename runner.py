@@ -764,6 +764,36 @@ async def run_user_bot(config):
         logger.error(f"[{phone}] Connection failure: {e}")
         return
 
+    async def auto_populate_chat_ids():
+        try:
+            dialogs = await client.get_dialogs()
+            gmap = config.get("group_map", {})
+            if not isinstance(gmap, dict):
+                gmap = {}
+            updated = False
+            for d in dialogs:
+                ent = d.entity
+                if hasattr(ent, 'id'):
+                    cid = ent.id
+                    username = getattr(ent, 'username', None)
+                    if username:
+                        u1 = f"https://t.me/{username}"
+                        if gmap.get(u1) != cid:
+                            gmap[u1] = cid
+                            updated = True
+                    u2 = f"https://t.me/c/{cid}"
+                    if gmap.get(u2) != cid:
+                        gmap[u2] = cid
+                        updated = True
+                    gmap[str(cid)] = cid
+            if updated:
+                config["group_map"] = gmap
+                await asyncio.to_thread(db.update_user_config, phone, group_map=gmap)
+        except Exception as e:
+            logger.debug(f"Auto-populate chat IDs background note: {e}")
+
+    asyncio.create_task(auto_populate_chat_ids())
+
 
     async def delayed_delete(chat_id, msg_ids, delay=40):
         await asyncio.sleep(delay)
