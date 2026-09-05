@@ -985,10 +985,23 @@ async def run_user_bot(config):
             await event.respond(reply)
 
         elif text.startswith(".fetch"):
-            progress_msg = await event.respond("⏳ **Fetching joined groups from your account...**")
+            progress_msg = await event.respond("⏳ **Fetching unadded joined groups from your account...**")
             try:
                 from telethon.tl.types import Channel, Chat
                 dialogs = await client.get_dialogs()
+                groups_list = _get_config_groups(config)
+                gmap = config.get("group_map", {})
+                if not isinstance(gmap, dict):
+                    gmap = {}
+
+                # Pre-build lookup set of already added group URLs and Chat IDs
+                already_added = set()
+                for g_item in groups_list:
+                    clean_g = g_item.strip().rstrip('/').lower()
+                    already_added.add(clean_g)
+                    if clean_g in gmap:
+                        already_added.add(str(gmap[clean_g]))
+
                 fetched = []
                 for d in dialogs:
                     ent = d.entity
@@ -1004,10 +1017,13 @@ async def run_user_bot(config):
 
                     if is_group:
                         username = getattr(ent, 'username', None)
+                        ent_id = getattr(ent, 'id', None)
+                        cid_str = str(ent_id) if ent_id else None
+
                         if username:
                             link = f"https://t.me/{username}"
-                        elif hasattr(ent, 'id'):
-                            cid = str(ent.id)
+                        elif ent_id:
+                            cid = str(ent_id)
                             if cid.startswith("-100"):
                                 cid = cid[4:]
                             elif cid.startswith("-"):
@@ -1016,17 +1032,22 @@ async def run_user_bot(config):
                         else:
                             continue
 
+                        # Exclude groups already added to target groups list!
+                        clean_link = link.strip().rstrip('/').lower()
+                        if clean_link in already_added or (username and f"https://t.me/{username}".lower() in already_added) or (cid_str and cid_str in already_added):
+                            continue
+
                         name = get_entity_display_name(ent, "Group")
                         fetched.append({
                             "title": name,
                             "link": link,
                             "username": username,
                             "entity": ent,
-                            "id": getattr(ent, 'id', None)
+                            "id": ent_id
                         })
 
                 if not fetched:
-                    await progress_msg.edit("📋 No joined groups found on this account.")
+                    await progress_msg.edit("📋 All joined groups are already added to your target list!")
                     return
 
                 # Store in user_state for sequence selection
