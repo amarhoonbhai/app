@@ -236,33 +236,57 @@ def _normalize_groups(val: Any) -> List[str]:
     """
     Ensures that groups is always converted to a clean List[str],
     handling strings, JSON-encoded strings, double-encoded JSON,
-    sets, tuples, None, or raw lists.
+    numeric IDs (int/float), sets, tuples, None, or raw lists.
     """
     if val is None:
         return []
-    
+    if isinstance(val, (int, float)):
+        return [str(val)]
     if isinstance(val, str):
         val = val.strip()
         if not val:
             return []
-        try:
-            parsed = json.loads(val)
-            return _normalize_groups(parsed)
-        except Exception:
-            parts = [p.strip() for p in re.split(r'[\s,\n]+', val) if p.strip()]
-            return parts
-            
+        while isinstance(val, str) and (val.startswith('"') or val.startswith("'")):
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, str):
+                    val = parsed.strip()
+                else:
+                    val = parsed
+                    break
+            except Exception:
+                break
+        if isinstance(val, (int, float)):
+            return [str(val)]
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                return _normalize_groups(parsed)
+            except Exception:
+                toks = [t.strip(" []\"'\t\r\n\\") for t in re.split(r'[\s,\n]+', val)]
+                return _normalize_groups([t for t in toks if t])
     if isinstance(val, (list, tuple, set)):
         result = []
         for item in val:
-            if isinstance(item, str):
-                item_str = item.strip()
+            if isinstance(item, (int, float)):
+                result.append(str(item))
+            elif isinstance(item, str):
+                item_str = item.strip(" []\"'\t\r\n\\")
                 if item_str:
+                    if item_str.startswith("@"):
+                        item_str = f"https://t.me/{item_str[1:]}"
+                    elif item_str.startswith("t.me/"):
+                        item_str = f"https://{item_str}"
                     result.append(item_str)
             elif item is not None:
                 result.extend(_normalize_groups(item))
-        return result
-        
+        seen = set()
+        dedup = []
+        for x in result:
+            if x not in seen:
+                seen.add(x)
+                dedup.append(x)
+        return dedup
     return []
 
 def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
