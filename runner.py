@@ -535,59 +535,23 @@ entity_cache = {} # clean_link -> (entity, timestamp)
 
 async def resolve_group_entity(client, group_url: Any, config: dict = None, phone: str = None):
     """
-    Resolves a group URL (public or private invite link) to a Telethon entity with caching
-    and permanent Channel ID fallback resolution. If username or link changes, this function
-    retains access by permanent ID and automatically updates the stored URL in config/DB.
+    Resolves a group URL (public or private invite link) or Channel ID to a Telethon entity
+    with caching and multi-stage fallback resolution.
     """
     group_str = str(group_url or "").strip()
     clean_link = group_str.rstrip('/')
+    if not clean_link:
+        return group_url
+
     now_ts = time.time()
     if clean_link in entity_cache:
         ent, cached_at = entity_cache[clean_link]
-        if now_ts - cached_at < 300:
+        if now_ts - cached_at < 300 and not isinstance(ent, str):
             return ent
 
     ent = None
 
-    # 1. Handle private invite links
-    if "t.me/+" in clean_link or "t.me/joinchat/" in clean_link:
-        if "t.me/+" in clean_link:
-            hash_val = clean_link.split('+')[-1]
-        else:
-            hash_val = clean_link.split('joinchat/')[-1]
-
-        from telethon.tl.functions.messages import CheckChatInviteRequest
-        from telethon.tl.types import ChatInviteAlready
-        try:
-            res = await client(CheckChatInviteRequest(hash_val))
-            if isinstance(res, ChatInviteAlready) and getattr(res, 'chat', None):
-                ent = res.chat
-        except Exception as e:
-            logger.debug(f"Invite check note for {group_url}: {e}")
-
-    # 2. Try direct resolution via client.get_entity()
-    if not ent:
-        try:
-            ent = await client.get_entity(clean_link)
-        except Exception as e:
-            logger.debug(f"Direct entity resolution for {group_url} failed: {e}")
-            ent = None
-
-    # 3. If direct resolution succeeded, save ID mapping and return
-    if ent and hasattr(ent, 'id'):
-        entity_cache[clean_link] = (ent, now_ts)
-        if config is not None:
-            gmap = config.get("group_map", {})
-            if not isinstance(gmap, dict):
-                gmap = {}
-            if gmap.get(clean_link) != ent.id:
-                gmap[clean_link] = ent.id
-                config["group_map"] = gmap
-                if phone:
-                    await asyncio.to_thread(db.update_user_config, phone, group_map=gmap)
-        return ent
-
-    # 4. Direct resolution failed (e.g. Link Changed / Username Revoked) -> Permanent Channel ID Fallback!
+    # Step 1: Extract numeric channel_id from link, raw digits, or group_map
     channel_id = None
     if config:
         gmap = config.get("group_map", {})
@@ -606,60 +570,81 @@ async def resolve_group_entity(client, group_url: Any, config: dict = None, phon
             if cid_part.isdigit():
                 channel_id = int(cid_part)
 
+    # Step 2: Fast resolution via Channel ID
     if channel_id:
         cid_clean = int(str(channel_id).replace("-100", "").replace("-", ""))
-        resolved_by_id = None
         try:
             from telethon.tl.types import PeerChannel
-            resolved_by_id = await client.get_entity(PeerChannel(cid_clean))
+            ent = await client.get_entity(PeerChannel(cid_clean))
         except Exception:
             try:
-                resolved_by_id = await client.get_entity(channel_id)
+                ent = await client.get_entity(channel_id)
             except Exception:
                 pass
 
-        if not resolved_by_id:
+        if not ent:
             try:
                 dialogs = await client.get_dialogs()
+                match_ids = {channel_id, cid_clean, -cid_clean}
                 for d in dialogs:
                     d_ent = d.entity
-                    if hasattr(d_ent, 'id') and getattr(d_ent, 'id', None) in (channel_id, cid_clean):
-                        resolved_by_id = d_ent
+                    ent_id = getattr(d_ent, 'id', None)
+                    dlg_id = getattr(d, 'id', None)
+                    if (ent_id in match_ids) or (dlg_id in match_ids) or (ent_id and abs(ent_id) == cid_clean) or (dlg_id and abs(dlg_id) == cid_clean):
+                        ent = d_ent
                         break
             except Exception as e:
-                logger.error(f"Error checking dialogs for channel ID {channel_id}: {e}")
+                logger.debug(f"Dialog check note for channel ID {channel_id}: {e}")
 
-        if resolved_by_id:
-            username = getattr(resolved_by_id, 'username', None)
-            new_link = f"https://t.me/{username}" if username else f"https://t.me/c/{channel_id}"
+    # Step 3: Handle private invite links (t.me/+hash)
+    if not ent and ("t.me/+" in clean_link or "t.me/joinchat/" in clean_link):
+        hash_val = clean_link.split('+')[-1] if "t.me/+" in clean_link else clean_link.split('joinchat/')[-1]
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        from telethon.tl.types import ChatInviteAlready
+        try:
+            res = await client(CheckChatInviteRequest(hash_val))
+            if isinstance(res, ChatInviteAlready) and getattr(res, 'chat', None):
+                ent = res.chat
+        except Exception as e:
+            logger.debug(f"Invite check note for {group_url}: {e}")
 
-            entity_cache[new_link] = (resolved_by_id, now_ts)
-            entity_cache[clean_link] = (resolved_by_id, now_ts)
+    # Step 4: Direct username/link resolution via client.get_entity()
+    if not ent and not clean_link.startswith("-") and not clean_link.isdigit() and "/c/" not in clean_link:
+        try:
+            ent = await client.get_entity(clean_link)
+        except Exception as e:
+            logger.debug(f"Direct entity resolution for {group_url} failed: {e}")
+            ent = None
 
-            if config is not None:
-                groups = _get_config_groups(config)
-                replaced = False
-                for idx_g, g_item in enumerate(groups):
-                    if g_item.strip().rstrip('/') == clean_link or g_item == group_url:
-                        groups[idx_g] = new_link
-                        replaced = True
-                        break
-                if replaced:
-                    config["groups"] = groups
-                    gmap = config.get("group_map", {})
-                    if not isinstance(gmap, dict):
-                        gmap = {}
-                    if clean_link in gmap:
-                        del gmap[clean_link]
-                    gmap[new_link] = channel_id
-                    config["group_map"] = gmap
-                    if phone:
-                        await asyncio.to_thread(db.update_user_config, phone, groups=groups, group_map=gmap)
-                    logger.info(f"🔄 Group link updated automatically: {group_url} ➔ {new_link} (ID: {channel_id})")
+    # Step 5: Fallback dialog scan by username or title match
+    if not ent:
+        try:
+            target_name = clean_link.split('/')[-1].replace('@', '').lower()
+            dialogs = await client.get_dialogs()
+            for d in dialogs:
+                d_ent = d.entity
+                u_name = getattr(d_ent, 'username', None)
+                if u_name and u_name.lower() == target_name:
+                    ent = d_ent
+                    break
+        except Exception:
+            pass
 
-            return resolved_by_id
+    # Save mapping and cache ONLY if valid entity resolved
+    if ent and hasattr(ent, 'id'):
+        entity_cache[clean_link] = (ent, now_ts)
+        if config is not None:
+            gmap = config.get("group_map", {})
+            if not isinstance(gmap, dict):
+                gmap = {}
+            if gmap.get(clean_link) != ent.id:
+                gmap[clean_link] = ent.id
+                config["group_map"] = gmap
+                if phone:
+                    await asyncio.to_thread(db.update_user_config, phone, group_map=gmap)
+        return ent
 
-    # Fallback to returning original group_url
+    # Return original group_url string (do NOT cache string failure)
     return group_url
 
 async def interruptible_sleep(get_target_time, tz_name: str):
