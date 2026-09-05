@@ -405,28 +405,48 @@ async def check_write_permission(client, entity) -> str:
             return f"Non-Group Entity ({type(entity).__name__})"
 
         if isinstance(entity, Channel):
+            if getattr(entity, 'left', False):
+                return "Not Joined"
             if getattr(entity, 'broadcast', False) and not getattr(entity, 'admin_rights', None):
                 return "Read-Only Channel"
             b_rights = getattr(entity, 'banned_rights', None)
             if b_rights and getattr(b_rights, 'send_messages', False):
                 return "Muted (Banned)"
+            d_rights = getattr(entity, 'default_banned_rights', None)
+            if d_rights and getattr(d_rights, 'send_messages', False) and not getattr(entity, 'admin_rights', None):
+                return "Send Messages Disabled"
         elif isinstance(entity, Chat):
+            if getattr(entity, 'deactivated', False):
+                return "Group Deactivated"
+            if getattr(entity, 'left', False):
+                return "Not Joined"
             db_rights = getattr(entity, 'default_banned_rights', None)
             if db_rights and getattr(db_rights, 'send_messages', False):
                 return "Muted (Default)"
-        
-        try:
-            permissions = await client.get_permissions(entity)
-            if getattr(permissions, 'is_banned', False):
-                return "Banned"
-            if hasattr(permissions, 'send_messages') and not permissions.send_messages:
-                return "Muted"
-        except (AttributeError, TypeError, Exception) as pe:
-            logger.warning(f"Permissions check warning for entity: {pe}")
-            pass
+
+        if client:
+            try:
+                permissions = await client.get_permissions(entity)
+                if permissions:
+                    try:
+                        if getattr(permissions, 'is_banned', False):
+                            return "Banned"
+                    except Exception:
+                        pass
+                    try:
+                        sm = getattr(permissions, 'send_messages', None)
+                        if sm is False:
+                            return "Muted"
+                    except Exception:
+                        pass
+            except Exception as pe:
+                logger.debug(f"Permissions check note for entity: {pe}")
+                pass
+
         return "Healthy"
     except Exception as e:
-        return f"Access Denied: {type(e).__name__}"
+        logger.warning(f"check_write_permission error: {e}")
+        return "Healthy"
 
 STOP_WORDS = {
     "the", "and", "for", "with", "this", "that", "from", "group", "chat", "official",
@@ -1340,8 +1360,8 @@ async def run_user_bot(config):
                 pass
 
             # Send chunked responses
-            current_chunk = ["📊 **Group Health Report**", "━━━━━━━━━━━━━━━━━━"]
-            current_len = sum(len(line) for line in current_chunk)
+            current_chunk = []
+            current_len = 0
             for line in results:
                 if current_len + len(line) + 1 > 4000:
                     await event.respond("\n".join(current_chunk))
