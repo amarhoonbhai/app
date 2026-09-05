@@ -343,6 +343,36 @@ def _seconds_until_quiet_start(cfg: dict = None) -> int:
         start_dt = start_dt + timedelta(days=1)
     return int((start_dt - now).total_seconds())
 
+def parse_number_ranges(input_str: str, max_count: int) -> List[int]:
+    """
+    Parses strings like '1, 2, 5', '1-5, 8, 10-12', '1 2 3', or 'all'/'al'.
+    Returns a sorted list of valid 1-indexed integers up to max_count.
+    """
+    s = input_str.strip().lower()
+    if s in ("all", "al", "*"):
+        return list(range(1, max_count + 1))
+
+    indices = set()
+    clean_s = re.sub(r'[,;\n]+', ' ', s)
+    tokens = clean_s.split()
+
+    for token in tokens:
+        range_match = re.fullmatch(r'(\d+)\s*(?:-|\.\.)\s*(\d+)', token)
+        if range_match:
+            start_num = int(range_match.group(1))
+            end_num = int(range_match.group(2))
+            if start_num > end_num:
+                start_num, end_num = end_num, start_num
+            for n in range(start_num, end_num + 1):
+                if 1 <= n <= max_count:
+                    indices.add(n)
+        elif token.isdigit():
+            n = int(token)
+            if 1 <= n <= max_count:
+                indices.add(n)
+
+    return sorted(list(indices))
+
 def get_entity_display_name(entity: Any, fallback: str) -> str:
     """Safely returns entity title, name, or username without raising AttributeError."""
     if not entity or isinstance(entity, str):
@@ -824,7 +854,128 @@ async def run_user_bot(config):
 
             await event.respond(reply)
 
-        elif text.startswith(".add"):
+        elif text.startswith(".fetch"):
+            progress_msg = await event.respond("⏳ **Fetching joined groups & channels from your account...**")
+            try:
+                from telethon.tl.types import Channel, Chat
+                dialogs = await client.get_dialogs()
+                fetched = []
+                for d in dialogs:
+                    ent = d.entity
+                    # Filter: Keep ONLY groups, supergroups, and channels (exclude Users / Bots)
+                    if isinstance(ent, (Channel, Chat)):
+                        username = getattr(ent, 'username', None)
+                        if username:
+                            link = f"https://t.me/{username}"
+                        elif hasattr(ent, 'id'):
+                            cid = str(ent.id)
+                            if cid.startswith("-100"):
+                                cid = cid[4:]
+                            elif cid.startswith("-"):
+                                cid = cid[1:]
+                            link = f"https://t.me/c/{cid}"
+                        else:
+                            continue
+
+                        name = get_entity_display_name(ent, "Group")
+                        fetched.append({
+                            "title": name,
+                            "link": link,
+                            "username": username,
+                            "entity": ent
+                        })
+
+                if not fetched:
+                    await progress_msg.edit("📋 No joined groups or channels found on this account.")
+                    return
+
+                # Store in user_state for sequence selection
+                user_state["fetched_groups"] = fetched
+
+                lines = [
+                    f"📋 **Joined Groups & Channels ({len(fetched)})**",
+                    "━━━━━━━━━━━━━━━━━━"
+                ]
+                for idx, item in enumerate(fetched, 1):
+                    tag_str = f" (@{item['username']})" if item['username'] else f" ({item['link']})"
+                    lines.append(f"{idx}. 👥 **{item['title']}**{tag_str}")
+
+                lines.append("━━━━━━━━━━━━━━━━━━")
+                lines.append("💡 **Option 1**: `.addnum 1,3,5` or `.addnum 1-5` or `.addnum all` (Add via sequence numbers)")
+                lines.append("💡 **Option 2**: `.add <url>` or `.addgroup <url1>, <url2>` (Add via manual link)")
+
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+
+                current_chunk = []
+                current_len = 0
+                for line in lines:
+                    if current_len + len(line) + 1 > 4000:
+                        await event.respond("\n".join(current_chunk))
+                        current_chunk = [line]
+                        current_len = len(line)
+                    else:
+                        current_chunk.append(line)
+                        current_len += len(line) + 1
+                if current_chunk:
+                    await event.respond("\n".join(current_chunk))
+
+            except Exception as e:
+                import traceback
+                logger.error(f"Fetch error: {e}", exc_info=True)
+                await progress_msg.edit(f"❌ Failed to fetch groups: {type(e).__name__} - {e}")
+
+        elif text.startswith(".addnum") or text.startswith(".select"):
+            fetched = user_state.get("fetched_groups", [])
+            if not fetched:
+                await event.respond("⚠️ No fetched groups available.\n💡 Please run `.fetch` first to view your joined groups list!")
+                return
+
+            arg = text[len(".addnum"):].strip() if text.startswith(".addnum") else text[len(".select"):].strip()
+            if not arg:
+                await event.respond("⚠️ Usage: `.addnum 1,3,5` or `.addnum 1-5` or `.addnum all`\n(Run `.fetch` first to view list)")
+                return
+
+            selected_indices = parse_number_ranges(arg, len(fetched))
+            if not selected_indices:
+                await event.respond(f"⚠️ Invalid selection. Range: 1 to {len(fetched)}")
+                return
+
+            groups_list = _get_config_groups(config)
+            added_names, skipped_names = [], []
+
+            for idx in selected_indices:
+                item = fetched[idx - 1]
+                link = item["link"]
+                if link not in groups_list:
+                    groups_list.append(link)
+                    added_names.append(f"{idx}. {item['title']}")
+                else:
+                    skipped_names.append(f"{idx}. {item['title']}")
+
+            config["groups"] = groups_list
+            await asyncio.to_thread(db.update_user_config, phone, groups=groups_list)
+
+            reply = [
+                "📊 **Sequence Group Selection Results**",
+                "━━━━━━━━━━━━━━━━━━"
+            ]
+            if added_names:
+                reply.append(f"✅ **Added ({len(added_names)}):**")
+                reply.extend(added_names[:25])
+                if len(added_names) > 25:
+                    reply.append(f"...and {len(added_names) - 25} more.")
+            if skipped_names:
+                reply.append(f"\n⚠️ **Skipped Duplicates ({len(skipped_names)}):**")
+                reply.extend(skipped_names[:10])
+
+            reply.append("\n━━━━━━━━━━━━━━━━━━")
+            reply.append(f"📍 **Total Active Target Groups:** `{len(groups_list)}`")
+            await event.respond("\n".join(reply))
+
+        elif text.startswith(".addgroup") or text.startswith(".add"):
             cmd_arg = text[len(".addgroup"):].strip() if text.startswith(".addgroup") else text[len(".add"):].strip()
             links = extract_and_normalize_links(cmd_arg)
             if not links:
@@ -1090,6 +1241,8 @@ async def run_user_bot(config):
                 "• `.mode <copy|forward>` — Switch sending style\n"
                 "\n🛰 **Target Groups Management:**\n"
                 "• `.add <url>` (or `.addgroup`) — Add target group(s)\n"
+                "• `.fetch` — List all joined groups with sequence numbers\n"
+                "• `.addnum <1,3|1-5|all>` — Add groups by sequence number\n"
                 "• `.delgroup <url>` — Remove specific group(s)\n"
                 "• `.delall` (or `.delgroup all`) — Clear all target groups\n"
                 "• `.groups` — Show all target groups\n"
