@@ -1309,7 +1309,10 @@ async def run_user_bot(config):
                 return
             
             progress_msg = await event.respond(f"🔍 Auditing permissions on {len(groups_list)} groups...")
-            results = []
+            results = [
+                f"📊 **Group Health Report ({len(groups_list)})**",
+                "━━━━━━━━━━━━━━━━━━"
+            ]
             groups_to_check = list(groups_list)
             for idx, group in enumerate(groups_to_check, 1):
                 group_str = str(group or "").strip()
@@ -1318,31 +1321,17 @@ async def run_user_bot(config):
                     display_name = get_entity_display_name(target_entity, group_str)
 
                     if isinstance(target_entity, str):
-                        results.append(f"{idx}. 🗑️ **{display_name}** | Access Denied (Auto-Removed)")
-                        cur_groups = _get_config_groups(config)
-                        to_rem = [g for g in cur_groups if str(g).strip() == group_str or g == group]
-                        if to_rem:
-                            for g in to_rem:
-                                cur_groups.remove(g)
-                            config["groups"] = cur_groups
-                            await asyncio.to_thread(db.update_user_config, phone, groups=cur_groups)
+                        results.append(f"{idx}. ❌ **{display_name}** | Access Denied")
                         continue
                     
                     status = await check_write_permission(client, target_entity)
                     if status == "Healthy":
                         results.append(f"{idx}. ✅ **{display_name}** | Healthy")
                     else:
-                        results.append(f"{idx}. 🗑️ **{display_name}** | {status} (Auto-Removed)")
-                        cur_groups = _get_config_groups(config)
-                        to_rem = [g for g in cur_groups if str(g).strip() == group_str or g == group]
-                        if to_rem:
-                            for g in to_rem:
-                                cur_groups.remove(g)
-                            config["groups"] = cur_groups
-                            await asyncio.to_thread(db.update_user_config, phone, groups=cur_groups)
+                        results.append(f"{idx}. ⚠️ **{display_name}** | {status}")
                 except Exception as e:
                     logger.error(f"Check error on {group_str}: {e}", exc_info=True)
-                    results.append(f"{idx}. 🗑️ **{group_str}** | Error: {type(e).__name__} ({e})")
+                    results.append(f"{idx}. ❌ **{group_str}** | Error: {type(e).__name__}")
             
             # Delete progress message safely
             try:
@@ -1505,10 +1494,9 @@ async def run_user_bot(config):
                         try:
                             target_entity = await resolve_group_entity(client, group, config=config, phone=phone)
                             if isinstance(target_entity, str):
-                                log_event(f"Cannot resolve {group}. Auto-removing group.")
+                                log_event(f"Cannot resolve {group}. Skipping group.")
                                 user_state["fail_total"] += 1
                                 user_state["current_cycle_fail"] += 1
-                                await remove_denied_group(group)
                                 continue
 
                             # 🎯 Smart Ad Sender: Select message matching group topic tags, or fall back to default flow
@@ -1579,10 +1567,9 @@ async def run_user_bot(config):
                         except Exception as e:
                              import traceback
                              tb_str = traceback.format_exc()
-                             log_event(f"Unable to send message to {group} ({type(e).__name__}: {e}). Auto-removing group.", details=tb_str)
+                             log_event(f"Unable to send message to {group} ({type(e).__name__}: {e}). Skipping group.", details=tb_str)
                              user_state["fail_total"] += 1
                              user_state["current_cycle_fail"] += 1
-                             await remove_denied_group(group)
 
                         # Always sleep the delay between groups (unless custom sleep occurred or it is the last group)
                         if i < len(groups_list) and not custom_sleep_done:
