@@ -889,12 +889,12 @@ async def run_user_bot(config):
         elif text.startswith(".delay"):
             value = int(''.join(filter(str.isdigit, text)) or "0")
             if value <= 0:
-                await event.respond("❗ Usage: `.delay 30` (seconds)")
+                await event.respond("❗ Usage: `.delay 25` (seconds)")
                 return
             
-            if value < 10:
-                await event.respond("⚠️ Minimum message delay is **10 seconds**. Setting to 10s.")
-                value = 10
+            if value < 20:
+                await event.respond("🛡️ Minimum safe message delay is **20 seconds** to prevent Telegram bans. Setting to 20s.")
+                value = 20
                 
             user_state["delay"] = value
             config["msg_delay_sec"] = value
@@ -902,7 +902,7 @@ async def run_user_bot(config):
             
             tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
             user_state["next_msg_at"] = _get_now_tz(tz) + timedelta(seconds=value)
-            await event.respond(f"✅ Message delay set to **{value} seconds** (Randomized ±15%)")
+            await event.respond(f"🛡️ Safe message delay set to **{value} seconds** (Organic Human Jitter ±20%)")
 
 
         elif text.startswith(".status"):
@@ -1590,10 +1590,11 @@ async def run_user_bot(config):
 
                         # Always sleep the delay between groups (unless custom sleep occurred or it is the last group)
                         if i < len(groups_list) and not custom_sleep_done:
-                            wait_time = user_state["delay"] * random.uniform(0.9, 1.1)
+                            # 🛡️ Organic Human Jitter (85% - 125%) to evade Telegram automated bot detection patterns
+                            wait_time = max(20.0, user_state["delay"]) * random.uniform(0.85, 1.25)
                             # Subtract the message-sending duration to avoid latency drift accumulation
                             elapsed = (_get_now_tz(tz) - send_start).total_seconds()
-                            remaining_wait = max(0.1, wait_time - elapsed)
+                            remaining_wait = max(0.5, wait_time - elapsed)
                             
                             now = _get_now_tz(tz)
                             user_state["next_msg_at"] = now + timedelta(seconds=remaining_wait)
@@ -1604,12 +1605,16 @@ async def run_user_bot(config):
                     if interrupted_by_night:
                         break # exit message loop and go back to outer while True
 
-                    # Adaptive optimization: If cycle was perfect, slightly reduce delay (but not below 20s)
-                    if user_state["current_cycle_fail"] == 0 and user_state["current_cycle_success"] > 0:
-                        if user_state["delay"] > 25:
-                            user_state["delay"] -= 2
-                            config["msg_delay_sec"] = user_state["delay"]
-                            db.update_user_config(phone, msg_delay_sec=user_state["delay"])
+                    # 🛡️ Adaptive Safety Backoff: If cycle had errors, increase delay by +5s to protect account
+                    if user_state["current_cycle_fail"] > 0:
+                        user_state["delay"] = min(user_state["delay"] + 5, 120)
+                        config["msg_delay_sec"] = user_state["delay"]
+                        db.update_user_config(phone, msg_delay_sec=user_state["delay"])
+                        log_event(f"🛡️ Errors detected in cycle. Adaptively increased delay to {user_state['delay']}s for account safety.")
+                    elif user_state["current_cycle_success"] > 0 and user_state["delay"] > 25:
+                        user_state["delay"] -= 1
+                        config["msg_delay_sec"] = user_state["delay"]
+                        db.update_user_config(phone, msg_delay_sec=user_state["delay"])
 
                     log_event(f"Msg {msg_idx} cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
                     
