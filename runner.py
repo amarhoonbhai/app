@@ -419,15 +419,17 @@ def get_group_search_keywords(group_url: str, target_entity: Any) -> set:
         if len(p) >= 3 and p not in STOP_WORDS and not p.startswith("http") and not p.isdigit():
             keywords.add(p)
 
-    if hasattr(target_entity, 'title') and target_entity.title:
-        title_parts = re.split(r'[\s/_.-]+', target_entity.title.lower())
+    title = getattr(target_entity, 'title', None)
+    if title and isinstance(title, str):
+        title_parts = re.split(r'[\s/_.-]+', title.lower())
         for p in title_parts:
             p_clean = re.sub(r'\W+', '', p)
             if len(p_clean) >= 3 and p_clean not in STOP_WORDS and not p_clean.isdigit():
                 keywords.add(p_clean)
 
-    if hasattr(target_entity, 'username') and target_entity.username:
-        u_parts = re.split(r'[/_.-]+', target_entity.username.lower())
+    username = getattr(target_entity, 'username', None)
+    if username and isinstance(username, str):
+        u_parts = re.split(r'[/_.-]+', username.lower())
         for p in u_parts:
             if len(p) >= 3 and p not in STOP_WORDS and not p.isdigit():
                 keywords.add(p)
@@ -470,6 +472,13 @@ def find_smart_matched_message(group_url: str, target_entity: Any, valid_message
 
     return best_msg
 
+def _get_config_groups(config: dict) -> List[str]:
+    groups = config.get("groups", [])
+    if not isinstance(groups, list):
+        groups = db._normalize_groups(groups)
+        config["groups"] = groups
+    return groups
+
 entity_cache = {} # clean_link -> (entity, timestamp)
 
 async def resolve_group_entity(client, group_url: str):
@@ -494,14 +503,18 @@ async def resolve_group_entity(client, group_url: str):
         from telethon.tl.types import ChatInviteAlready, ChatInvite
         try:
             res = await client(CheckChatInviteRequest(hash_val))
-            if isinstance(res, ChatInviteAlready) and res.chat:
+            if isinstance(res, ChatInviteAlready) and getattr(res, 'chat', None):
+                entity_cache[clean_link] = (res.chat, now_ts)
                 return res.chat
         except Exception as e:
             logger.error(f"Error checking chat invite for {group_url}: {e}")
             
     # Try to resolve via client.get_entity() directly
     try:
-        return await client.get_entity(clean_link)
+        ent = await client.get_entity(clean_link)
+        if ent:
+            entity_cache[clean_link] = (ent, now_ts)
+        return ent
     except Exception as e:
         logger.error(f"Failed to get entity for {group_url}: {e}")
         return group_url
@@ -562,7 +575,7 @@ async def run_user_bot(config):
     }
 
     async def remove_denied_group(group_url: str):
-        groups = config.get("groups", [])
+        groups = _get_config_groups(config)
         if group_url in groups:
             groups.remove(group_url)
             config["groups"] = groups
@@ -734,7 +747,7 @@ async def run_user_bot(config):
                 f"⚙️ **System Status Panel**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🔄 **Current State:** `{user_state['status']}`\n"
-                f"📍 **Target Groups:** `{len(config.setdefault('groups', []))}`\n"
+                f"📍 **Target Groups:** `{len(_get_config_groups(config))}`\n"
                 f"🕒 **Next Action at:** `{next_msg_str}`\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"⏱ **Cycle Interval:** `{user_state['cycle']} min` (±15% jitter)\n"
@@ -784,7 +797,7 @@ async def run_user_bot(config):
                 f"👤 **Account:** {config.get('name')} ({phone})\n"
                 f"⏱ **Uptime:** `{uptime}`\n"
                 f"🔄 **Status:** {user_state['status']}\n"
-                f"📍 **Groups:** {len(config.setdefault('groups', []))}\n"
+                f"📍 **Groups:** {len(_get_config_groups(config))}\n"
                 f"⚡ **Average Speed:** `{sends_per_hour:.1f} posts/hour`\n"
                 f"{quiet_countdown}\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -804,7 +817,7 @@ async def run_user_bot(config):
                 f"❀ Name: {config.get('name')}\n"
                 f"❀ Cycle Delay: {user_state['cycle']} min\n"
                 f"❀ Message Delay: {user_state['delay']} sec\n"
-                f"❀ Groups: {len(config.setdefault('groups', []))}\n"
+                f"❀ Groups: {len(_get_config_groups(config))}\n"
                 f"❀ Plan Access: {expiry}\n\n"
                 + autonight_status_text(AUTONIGHT_CFG)
             )
@@ -818,13 +831,14 @@ async def run_user_bot(config):
                 await event.respond("⚠️ No valid group links or usernames found.\nFormat: `.add @group1` or `.addgroup @group1, https://t.me/group2` or split by newlines.")
                 return
             added, skipped = [], []
-            groups_list = config.setdefault("groups", [])
+            groups_list = _get_config_groups(config)
             for link in links:
                 if link not in groups_list:
                     groups_list.append(link)
                     added.append(link)
                 else:
                     skipped.append(link)
+            config["groups"] = groups_list
             db.update_user_config(phone, groups=groups_list)
             msg = []
             if added:
@@ -853,7 +867,7 @@ async def run_user_bot(config):
                 await event.respond("⚠️ Usage: `.delgroup <link1> ...` or `.delgroup all` to clear list.")
                 return
             removed, skipped = [], []
-            groups_list = config.setdefault("groups", [])
+            groups_list = _get_config_groups(config)
             for link in links:
                 normalized_link = link.rstrip('/')
                 found = None
@@ -866,6 +880,7 @@ async def run_user_bot(config):
                     removed.append(link)
                 else:
                     skipped.append(link)
+            config["groups"] = groups_list
             db.update_user_config(phone, groups=groups_list)
             msg = []
             if removed:
@@ -875,7 +890,7 @@ async def run_user_bot(config):
             await event.respond("\n".join(msg) or "No changes.")
 
         elif text.startswith(".groups"):
-            groups_list = config.setdefault("groups", [])
+            groups_list = _get_config_groups(config)
             if not groups_list:
                 await event.respond("📋 No groups configured.")
             else:
@@ -950,7 +965,7 @@ async def run_user_bot(config):
             await progress_msg.edit(f"📊 **Join Session Complete!**\n━━━━━━━━━━━━━━━━━━\n✅ Successfully Joined: **{success}**\n❌ Failed / Already Joined: **{fail}**")
 
         elif text.startswith(".check"):
-            groups_list = config.setdefault("groups", [])
+            groups_list = _get_config_groups(config)
             if not groups_list:
                 await event.respond("📋 No groups configured to check.")
                 return
@@ -965,9 +980,11 @@ async def run_user_bot(config):
 
                     if isinstance(target_entity, str):
                         results.append(f"{idx}. 🗑️ **{display_name}** | Access Denied (Auto-Removed)")
-                        if group in config["groups"]:
-                            config["groups"].remove(group)
-                            await asyncio.to_thread(db.update_user_config, phone, groups=config["groups"])
+                        cur_groups = _get_config_groups(config)
+                        if group in cur_groups:
+                            cur_groups.remove(group)
+                            config["groups"] = cur_groups
+                            await asyncio.to_thread(db.update_user_config, phone, groups=cur_groups)
                         continue
                     
                     status = await check_write_permission(client, target_entity)
@@ -975,15 +992,19 @@ async def run_user_bot(config):
                         results.append(f"{idx}. ✅ **{display_name}** | Healthy")
                     else:
                         results.append(f"{idx}. 🗑️ **{display_name}** | {status} (Auto-Removed)")
-                        if group in config["groups"]:
-                            config["groups"].remove(group)
-                            await asyncio.to_thread(db.update_user_config, phone, groups=config["groups"])
+                        cur_groups = _get_config_groups(config)
+                        if group in cur_groups:
+                            cur_groups.remove(group)
+                            config["groups"] = cur_groups
+                            await asyncio.to_thread(db.update_user_config, phone, groups=cur_groups)
                 except Exception as e:
                     logger.error(f"Check error on {group}: {e}")
                     results.append(f"{idx}. 🗑️ **{group}** | Error: {type(e).__name__} (Auto-Removed)")
-                    if group in config["groups"]:
-                        config["groups"].remove(group)
-                        await asyncio.to_thread(db.update_user_config, phone, groups=config["groups"])
+                    cur_groups = _get_config_groups(config)
+                    if group in cur_groups:
+                        cur_groups.remove(group)
+                        config["groups"] = cur_groups
+                        await asyncio.to_thread(db.update_user_config, phone, groups=cur_groups)
             
             # Delete progress message safely
             try:
@@ -1097,7 +1118,7 @@ async def run_user_bot(config):
                         break # safety break
                 
                 # 🎯 Check if target groups are configured first
-                groups_list = config.setdefault("groups", [])
+                groups_list = _get_config_groups(config)
                 if not groups_list:
                     log_event("No target groups configured.")
                     user_state["status"] = "Idle (No Groups) 😴"
@@ -1130,7 +1151,7 @@ async def run_user_bot(config):
                     user_state["current_cycle_success"] = 0
                     user_state["current_cycle_fail"] = 0
 
-                    groups_list = config.setdefault("groups", [])
+                    groups_list = _get_config_groups(config)
                     for i, group in enumerate(groups_list, 1):
                         # If night starts mid-cycle, break early
                         if autonight_is_quiet(AUTONIGHT_CFG):

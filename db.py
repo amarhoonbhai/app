@@ -2,6 +2,7 @@ import os
 import sqlite3
 import json
 import time
+import re
 from typing import Dict, List, Any, Optional
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,7 +124,7 @@ def migrate_old_json():
                                 cdata = json.load(cf)
                             cycle_delay_min = cdata.get("cycle_delay_min", 7)
                             msg_delay_sec = cdata.get("msg_delay_sec", 30)
-                            groups = cdata.get("groups", [])
+                            groups = _normalize_groups(cdata.get("groups", []))
                             plan_expiry = cdata.get("plan_expiry", "Lifetime")
                         except Exception:
                             pass
@@ -229,6 +230,39 @@ def delete_user(phone: str):
     finally:
         conn.close()
 
+def _normalize_groups(val: Any) -> List[str]:
+    """
+    Ensures that groups is always converted to a clean List[str],
+    handling strings, JSON-encoded strings, double-encoded JSON,
+    sets, tuples, None, or raw lists.
+    """
+    if val is None:
+        return []
+    
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return []
+        try:
+            parsed = json.loads(val)
+            return _normalize_groups(parsed)
+        except Exception:
+            parts = [p.strip() for p in re.split(r'[\s,\n]+', val) if p.strip()]
+            return parts
+            
+    if isinstance(val, (list, tuple, set)):
+        result = []
+        for item in val:
+            if isinstance(item, str):
+                item_str = item.strip()
+                if item_str:
+                    result.append(item_str)
+            elif item is not None:
+                result.extend(_normalize_groups(item))
+        return result
+        
+    return []
+
 def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
     conn = get_db()
     try:
@@ -248,7 +282,7 @@ def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
             "api_hash": row["api_hash"],
             "cycle_delay_min": row["cycle_delay_min"],
             "msg_delay_sec": row["msg_delay_sec"],
-            "groups": json.loads(row["groups"] or "[]"),
+            "groups": _normalize_groups(row["groups"]),
             "plan_expiry": row["plan_expiry"],
             "proxy": proxy_val
         }
@@ -262,11 +296,14 @@ def update_user_config(phone: str, **kwargs):
         set_clauses = []
         params = []
         for key, val in kwargs.items():
-            if val is not None:
-                if key in ("groups", "proxy"):
-                    val = json.dumps(val) if val is not None else None
-                set_clauses.append(f"{key} = ?")
-                params.append(val)
+            if key == "groups":
+                val = json.dumps(_normalize_groups(val))
+            elif key == "proxy":
+                val = json.dumps(val) if val is not None else None
+            elif val is None:
+                pass
+            set_clauses.append(f"{key} = ?")
+            params.append(val)
         if not set_clauses:
             return
         set_clauses.append("updated_at = ?")
@@ -293,7 +330,7 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
                 "api_hash": r["api_hash"],
                 "cycle_delay_min": r["cycle_delay_min"],
                 "msg_delay_sec": r["msg_delay_sec"],
-                "groups": json.loads(r["groups"] or "[]"),
+                "groups": _normalize_groups(r["groups"]),
                 "plan_expiry": r["plan_expiry"],
                 "proxy": json.loads(r["proxy"]) if r["proxy"] else None,
                 "updated_at": r["updated_at"]
