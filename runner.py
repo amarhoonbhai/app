@@ -775,7 +775,14 @@ async def run_user_bot(config):
             updated = False
             for d in dialogs:
                 ent = d.entity
-                if isinstance(ent, (Channel, Chat)) and hasattr(ent, 'id'):
+                is_group = False
+                if isinstance(ent, Chat):
+                    is_group = True
+                elif isinstance(ent, Channel):
+                    if getattr(ent, 'megagroup', False) or getattr(ent, 'gigagroup', False) or not getattr(ent, 'broadcast', False):
+                        is_group = True
+
+                if is_group and hasattr(ent, 'id'):
                     cid = ent.id
                     username = getattr(ent, 'username', None)
                     if username:
@@ -978,15 +985,24 @@ async def run_user_bot(config):
             await event.respond(reply)
 
         elif text.startswith(".fetch"):
-            progress_msg = await event.respond("⏳ **Fetching joined groups & channels from your account...**")
+            progress_msg = await event.respond("⏳ **Fetching joined groups from your account...**")
             try:
                 from telethon.tl.types import Channel, Chat
                 dialogs = await client.get_dialogs()
                 fetched = []
                 for d in dialogs:
                     ent = d.entity
-                    # Filter: Keep ONLY groups, supergroups, and channels (exclude Users / Bots)
-                    if isinstance(ent, (Channel, Chat)):
+                    # Filter: Keep ONLY groups & supergroups (exclude Users, Bots, and Broadcast Channels)
+                    is_group = False
+                    if isinstance(ent, Chat):
+                        is_group = True
+                    elif isinstance(ent, Channel):
+                        if getattr(ent, 'megagroup', False) or getattr(ent, 'gigagroup', False):
+                            is_group = True
+                        elif not getattr(ent, 'broadcast', False):
+                            is_group = True
+
+                    if is_group:
                         username = getattr(ent, 'username', None)
                         if username:
                             link = f"https://t.me/{username}"
@@ -1010,14 +1026,14 @@ async def run_user_bot(config):
                         })
 
                 if not fetched:
-                    await progress_msg.edit("📋 No joined groups or channels found on this account.")
+                    await progress_msg.edit("📋 No joined groups found on this account.")
                     return
 
                 # Store in user_state for sequence selection
                 user_state["fetched_groups"] = fetched
 
                 lines = [
-                    f"📋 **Joined Groups & Channels ({len(fetched)})**",
+                    f"📋 **Joined Target Groups ({len(fetched)})**",
                     "━━━━━━━━━━━━━━━━━━"
                 ]
                 for idx, item in enumerate(fetched, 1):
