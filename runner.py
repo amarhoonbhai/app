@@ -209,7 +209,7 @@ def _seconds_until_quiet_end(cfg: dict = None) -> int:
     seconds = int((end_dt - now).total_seconds())
     return max(1, seconds)
 
-def autonight_is_quiet(cfg: dict = None) -> bool:
+def autonight_is_slow_mode(cfg: dict = None) -> bool:
     if cfg is None or cfg is AUTONIGHT_CFG:
         cfg = reload_autonight_cfg()
     if not cfg.get("enabled", True):
@@ -220,16 +220,20 @@ def autonight_is_quiet(cfg: dict = None) -> bool:
         end_t   = _parse_hhmm(cfg.get("end", DEFAULT_AUTONIGHT["end"]))
         return _in_window(now.time(), start_t, end_t)
     except Exception:
-        # Fail open if config broken
         return False
+
+def autonight_is_quiet(cfg: dict = None) -> bool:
+    return autonight_is_slow_mode(cfg)
 
 def autonight_status_text(cfg: dict = None) -> str:
     if cfg is None or cfg is AUTONIGHT_CFG:
         cfg = reload_autonight_cfg()
-    state = "ACTIVE ✅" if cfg.get("enabled", True) else "DISABLED ❌"
+    state = "ENABLED 🌙 (Slow Speed Mode)" if cfg.get("enabled", True) else "DISABLED ❌"
     return (
-        f"🌙 Auto-Night: **{state}**\n"
-        f"Window: **{cfg.get('start','00:00')} → {cfg.get('end','06:00')}**\n"
+        f"🌙 Auto-Night Mode: **{state}**\n"
+        f"Slow Window: **{cfg.get('start','00:00')} → {cfg.get('end','07:00')}** (Late Night / After 12 AM)\n"
+        f"☀️ Day Speed (07:00 → 00:00): **Safe Normal Speed (20s delay, 7m cycle)**\n"
+        f"🌙 Night Speed (00:00 → 07:00): **Ultra-Safe Slow Speed (45s–60s delay, 15m–20m cycle)**\n"
         f"TZ: **{cfg.get('tz','Asia/Kolkata')}**"
     )
 
@@ -1452,16 +1456,6 @@ async def run_user_bot(config):
         while True:
             tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
             try:
-                # 🌙 If within quiet hours, check every minute if still quiet
-                while autonight_is_quiet(AUTONIGHT_CFG):
-                    user_state["status"] = "Quiet Mode 🌙"
-                    secs_to_end = _seconds_until_quiet_end(AUTONIGHT_CFG)
-                    # Sleep max 60s at a time to allow immediate wake-up if config changes
-                    sleep_step = min(secs_to_end, 60)
-                    if sleep_step > 0:
-                        await asyncio.sleep(sleep_step)
-                    else:
-                        break # safety break
                 
                 # 🎯 Check if target groups are configured first
                 groups_list = _get_config_groups(config)
@@ -1590,8 +1584,14 @@ async def run_user_bot(config):
 
                         # Always sleep the delay between groups (unless custom sleep occurred or it is the last group)
                         if i < len(groups_list) and not custom_sleep_done:
+                            # 🌙 Check if late night slow mode (00:00 -> 07:00 / after 12 AM)
+                            if autonight_is_slow_mode(AUTONIGHT_CFG):
+                                eff_delay = max(user_state["delay"], 50.0) # 50s-65s slow delay overnight
+                            else:
+                                eff_delay = max(20.0, user_state["delay"])
+
                             # 🛡️ Organic Human Jitter (85% - 125%) to evade Telegram automated bot detection patterns
-                            wait_time = max(20.0, user_state["delay"]) * random.uniform(0.85, 1.25)
+                            wait_time = eff_delay * random.uniform(0.85, 1.25)
                             # Subtract the message-sending duration to avoid latency drift accumulation
                             elapsed = (_get_now_tz(tz) - send_start).total_seconds()
                             remaining_wait = max(0.5, wait_time - elapsed)
@@ -1601,9 +1601,6 @@ async def run_user_bot(config):
                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
                         elif i == len(groups_list):
                             user_state["next_msg_at"] = None
-
-                    if interrupted_by_night:
-                        break # exit message loop and go back to outer while True
 
                     # 🛡️ Adaptive Safety Backoff: If cycle had errors, increase delay by +5s to protect account
                     if user_state["current_cycle_fail"] > 0:
@@ -1620,16 +1617,24 @@ async def run_user_bot(config):
                     
                     # Interval delay between different messages (with organic Timing Jitter)
                     if msg_idx < len(valid_messages):
-                        user_state["status"] = f"Waiting for next msg ⏳"
+                        if autonight_is_slow_mode(AUTONIGHT_CFG):
+                            user_state["status"] = "Waiting 🌙 (Night Slow Mode)"
+                            sleep_seconds = random.randint(900, 1200) # 15-20 minutes overnight
+                        else:
+                            user_state["status"] = f"Waiting for next msg ⏳"
+                            sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
                         now = _get_now_tz(tz)
-                        sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
                         user_state["next_msg_at"] = now + timedelta(seconds=sleep_seconds)
                         await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
 
-                # After all messages are processed, wait the cycle delay again before checking for new messages (with organic Timing Jitter)
-                user_state["status"] = "Idle 😴"
+                # After all messages are processed, wait the cycle delay again before checking for new messages
+                if autonight_is_slow_mode(AUTONIGHT_CFG):
+                    user_state["status"] = "Idle 🌙 (Night Slow Mode)"
+                    sleep_seconds = random.randint(900, 1200) # 15-20 minutes overnight
+                else:
+                    user_state["status"] = "Idle 😴"
+                    sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
                 now = _get_now_tz(tz)
-                sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
                 user_state["next_msg_at"] = now + timedelta(seconds=sleep_seconds)
                 await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
 
