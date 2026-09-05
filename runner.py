@@ -442,10 +442,10 @@ def extract_message_keywords(text: str) -> set:
     keywords = {w for w in words if w not in STOP_WORDS and not w.isdigit()}
     return keywords
 
-def get_group_search_keywords(group_url: str, target_entity: Any) -> set:
+def get_group_search_keywords(group_url: Any, target_entity: Any) -> set:
     """Extracts significant keywords from group title, username, and URL."""
     keywords = set()
-    clean_url = group_url.lower().strip().rstrip('/')
+    clean_url = str(group_url or "").lower().strip().rstrip('/')
     url_parts = re.split(r'[/_.-]+', clean_url)
     for p in url_parts:
         if len(p) >= 3 and p not in STOP_WORDS and not p.startswith("http") and not p.isdigit():
@@ -513,13 +513,14 @@ def _get_config_groups(config: dict) -> List[str]:
 
 entity_cache = {} # clean_link -> (entity, timestamp)
 
-async def resolve_group_entity(client, group_url: str, config: dict = None, phone: str = None):
+async def resolve_group_entity(client, group_url: Any, config: dict = None, phone: str = None):
     """
     Resolves a group URL (public or private invite link) to a Telethon entity with caching
     and permanent Channel ID fallback resolution. If username or link changes, this function
     retains access by permanent ID and automatically updates the stored URL in config/DB.
     """
-    clean_link = group_url.strip().rstrip('/')
+    group_str = str(group_url or "").strip()
+    clean_link = group_str.rstrip('/')
     now_ts = time.time()
     if clean_link in entity_cache:
         ent, cached_at = entity_cache[clean_link]
@@ -1311,15 +1312,18 @@ async def run_user_bot(config):
             results = []
             groups_to_check = list(groups_list)
             for idx, group in enumerate(groups_to_check, 1):
+                group_str = str(group or "").strip()
                 try:
-                    target_entity = await resolve_group_entity(client, group, config=config, phone=phone)
-                    display_name = get_entity_display_name(target_entity, group)
+                    target_entity = await resolve_group_entity(client, group_str, config=config, phone=phone)
+                    display_name = get_entity_display_name(target_entity, group_str)
 
                     if isinstance(target_entity, str):
                         results.append(f"{idx}. 🗑️ **{display_name}** | Access Denied (Auto-Removed)")
                         cur_groups = _get_config_groups(config)
-                        if group in cur_groups:
-                            cur_groups.remove(group)
+                        to_rem = [g for g in cur_groups if str(g).strip() == group_str or g == group]
+                        if to_rem:
+                            for g in to_rem:
+                                cur_groups.remove(g)
                             config["groups"] = cur_groups
                             await asyncio.to_thread(db.update_user_config, phone, groups=cur_groups)
                         continue
@@ -1330,18 +1334,15 @@ async def run_user_bot(config):
                     else:
                         results.append(f"{idx}. 🗑️ **{display_name}** | {status} (Auto-Removed)")
                         cur_groups = _get_config_groups(config)
-                        if group in cur_groups:
-                            cur_groups.remove(group)
+                        to_rem = [g for g in cur_groups if str(g).strip() == group_str or g == group]
+                        if to_rem:
+                            for g in to_rem:
+                                cur_groups.remove(g)
                             config["groups"] = cur_groups
                             await asyncio.to_thread(db.update_user_config, phone, groups=cur_groups)
                 except Exception as e:
-                    logger.error(f"Check error on {group}: {e}")
-                    results.append(f"{idx}. 🗑️ **{group}** | Error: {type(e).__name__} (Auto-Removed)")
-                    cur_groups = _get_config_groups(config)
-                    if group in cur_groups:
-                        cur_groups.remove(group)
-                        config["groups"] = cur_groups
-                        await asyncio.to_thread(db.update_user_config, phone, groups=cur_groups)
+                    logger.error(f"Check error on {group_str}: {e}", exc_info=True)
+                    results.append(f"{idx}. 🗑️ **{group_str}** | Error: {type(e).__name__} ({e})")
             
             # Delete progress message safely
             try:
