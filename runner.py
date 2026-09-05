@@ -1522,7 +1522,7 @@ async def run_user_bot(config):
                                 # 🌈 Copy Mode (with sequential message_id tag & entity formatting)
                                 user_state["msg_seq"] += 1
                                 seq_num = user_state["msg_seq"]
-                                base_text = (send_msg.text or "").strip()
+                                base_text = parse_spintax((send_msg.text or "").strip())
                                 seq_tag = f"message_id = #{seq_num}"
                                 caption = f"{base_text}\n\n{seq_tag}" if base_text else seq_tag
 
