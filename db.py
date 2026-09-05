@@ -56,11 +56,13 @@ def init_db():
             );
         """)
 
-        # Migration: Ensure proxy column exists on users table
+        # Migration: Ensure proxy and group_map columns exist on users table
         cursor.execute("PRAGMA table_info(users);")
         cols = [c[1] for c in cursor.fetchall()]
         if "proxy" not in cols:
             cursor.execute("ALTER TABLE users ADD COLUMN proxy TEXT DEFAULT NULL;")
+        if "group_map" not in cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN group_map TEXT DEFAULT '{}';")
         
         conn.commit()
     finally:
@@ -268,13 +270,19 @@ def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy FROM users WHERE phone = ?",
+            "SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy, group_map FROM users WHERE phone = ?",
             (phone,)
         )
         row = cursor.fetchone()
         if not row:
             return None
         proxy_val = json.loads(row["proxy"]) if row["proxy"] else None
+        gmap_val = {}
+        if "group_map" in row.keys() and row["group_map"]:
+            try:
+                gmap_val = json.loads(row["group_map"])
+            except Exception:
+                gmap_val = {}
         return {
             "phone": row["phone"],
             "name": row["name"],
@@ -284,7 +292,8 @@ def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
             "msg_delay_sec": row["msg_delay_sec"],
             "groups": _normalize_groups(row["groups"]),
             "plan_expiry": row["plan_expiry"],
-            "proxy": proxy_val
+            "proxy": proxy_val,
+            "group_map": gmap_val if isinstance(gmap_val, dict) else {}
         }
     finally:
         conn.close()
@@ -298,6 +307,8 @@ def update_user_config(phone: str, **kwargs):
         for key, val in kwargs.items():
             if key == "groups":
                 val = json.dumps(_normalize_groups(val))
+            elif key == "group_map":
+                val = json.dumps(val) if isinstance(val, dict) else (val or "{}")
             elif key == "proxy":
                 val = json.dumps(val) if val is not None else None
             elif val is None:
@@ -320,10 +331,17 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy, updated_at FROM users")
+        cursor.execute("SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy, group_map, updated_at FROM users")
         rows = cursor.fetchall()
-        return [
-            {
+        res = []
+        for r in rows:
+            gmap_val = {}
+            if "group_map" in r.keys() and r["group_map"]:
+                try:
+                    gmap_val = json.loads(r["group_map"])
+                except Exception:
+                    gmap_val = {}
+            res.append({
                 "phone": r["phone"],
                 "name": r["name"],
                 "api_id": r["api_id"],
@@ -333,11 +351,12 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
                 "groups": _normalize_groups(r["groups"]),
                 "plan_expiry": r["plan_expiry"],
                 "proxy": json.loads(r["proxy"]) if r["proxy"] else None,
+                "group_map": gmap_val if isinstance(gmap_val, dict) else {},
                 "updated_at": r["updated_at"]
-            }
-            for r in rows
-        ]
+            })
+        return res
     finally:
+        conn.close()
         conn.close()
 
 def get_admin_id() -> Optional[int]:

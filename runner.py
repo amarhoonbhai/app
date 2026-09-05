@@ -511,9 +511,11 @@ def _get_config_groups(config: dict) -> List[str]:
 
 entity_cache = {} # clean_link -> (entity, timestamp)
 
-async def resolve_group_entity(client, group_url: str):
+async def resolve_group_entity(client, group_url: str, config: dict = None, phone: str = None):
     """
-    Resolves a group URL (public or private invite link) to a Telethon entity with caching.
+    Resolves a group URL (public or private invite link) to a Telethon entity with caching
+    and permanent Channel ID fallback resolution. If username or link changes, this function
+    retains access by permanent ID and automatically updates the stored URL in config/DB.
     """
     clean_link = group_url.strip().rstrip('/')
     now_ts = time.time()
@@ -521,33 +523,113 @@ async def resolve_group_entity(client, group_url: str):
         ent, cached_at = entity_cache[clean_link]
         if now_ts - cached_at < 300:
             return ent
-    
-    # Handle private invite links
+
+    ent = None
+
+    # 1. Handle private invite links
     if "t.me/+" in clean_link or "t.me/joinchat/" in clean_link:
         if "t.me/+" in clean_link:
             hash_val = clean_link.split('+')[-1]
         else:
             hash_val = clean_link.split('joinchat/')[-1]
-            
+
         from telethon.tl.functions.messages import CheckChatInviteRequest
-        from telethon.tl.types import ChatInviteAlready, ChatInvite
+        from telethon.tl.types import ChatInviteAlready
         try:
             res = await client(CheckChatInviteRequest(hash_val))
             if isinstance(res, ChatInviteAlready) and getattr(res, 'chat', None):
-                entity_cache[clean_link] = (res.chat, now_ts)
-                return res.chat
+                ent = res.chat
         except Exception as e:
-            logger.error(f"Error checking chat invite for {group_url}: {e}")
-            
-    # Try to resolve via client.get_entity() directly
-    try:
-        ent = await client.get_entity(clean_link)
-        if ent:
-            entity_cache[clean_link] = (ent, now_ts)
+            logger.debug(f"Invite check note for {group_url}: {e}")
+
+    # 2. Try direct resolution via client.get_entity()
+    if not ent:
+        try:
+            ent = await client.get_entity(clean_link)
+        except Exception as e:
+            logger.debug(f"Direct entity resolution for {group_url} failed: {e}")
+            ent = None
+
+    # 3. If direct resolution succeeded, save ID mapping and return
+    if ent and hasattr(ent, 'id'):
+        entity_cache[clean_link] = (ent, now_ts)
+        if config is not None:
+            gmap = config.get("group_map", {})
+            if not isinstance(gmap, dict):
+                gmap = {}
+            if gmap.get(clean_link) != ent.id:
+                gmap[clean_link] = ent.id
+                config["group_map"] = gmap
+                if phone:
+                    await asyncio.to_thread(db.update_user_config, phone, group_map=gmap)
         return ent
-    except Exception as e:
-        logger.error(f"Failed to get entity for {group_url}: {e}")
-        return group_url
+
+    # 4. Direct resolution failed (e.g. Link Changed / Username Revoked) -> Permanent Channel ID Fallback!
+    channel_id = None
+    if config:
+        gmap = config.get("group_map", {})
+        if isinstance(gmap, dict) and clean_link in gmap:
+            channel_id = gmap[clean_link]
+
+    if not channel_id and "/c/" in clean_link:
+        cid_part = clean_link.split("/c/")[-1].split("/")[0]
+        if cid_part.isdigit():
+            channel_id = int(cid_part)
+
+    if channel_id:
+        resolved_by_id = None
+        try:
+            from telethon.tl.types import PeerChannel
+            resolved_by_id = await client.get_entity(PeerChannel(channel_id))
+        except Exception:
+            try:
+                resolved_by_id = await client.get_entity(channel_id)
+            except Exception:
+                pass
+
+        if not resolved_by_id:
+            try:
+                dialogs = await client.get_dialogs()
+                for d in dialogs:
+                    d_ent = d.entity
+                    if hasattr(d_ent, 'id') and d_ent.id == channel_id:
+                        resolved_by_id = d_ent
+                        break
+            except Exception as e:
+                logger.error(f"Error checking dialogs for channel ID {channel_id}: {e}")
+
+        if resolved_by_id:
+            username = getattr(resolved_by_id, 'username', None)
+            new_link = f"https://t.me/{username}" if username else f"https://t.me/c/{channel_id}"
+
+            entity_cache[new_link] = (resolved_by_id, now_ts)
+            entity_cache[clean_link] = (resolved_by_id, now_ts)
+
+            if config is not None:
+                groups = _get_config_groups(config)
+                replaced = False
+                for idx_g, g_item in enumerate(groups):
+                    if g_item.strip().rstrip('/') == clean_link or g_item == group_url:
+                        groups[idx_g] = new_link
+                        replaced = True
+                        break
+                if replaced:
+                    config["groups"] = groups
+                    gmap = config.get("group_map", {})
+                    if not isinstance(gmap, dict):
+                        gmap = {}
+                    if clean_link in gmap:
+                        del gmap[clean_link]
+                    gmap[new_link] = channel_id
+                    config["group_map"] = gmap
+                    if phone:
+                        await asyncio.to_thread(db.update_user_config, phone, groups=groups, group_map=gmap)
+                    logger.info(f"🔄 Group link updated automatically: {group_url} ➔ {new_link} (ID: {channel_id})")
+
+            return resolved_by_id
+
+    # Fallback to returning original group_url
+    return group_url
 
 async def interruptible_sleep(get_target_time, tz_name: str):
     while True:
@@ -944,11 +1026,17 @@ async def run_user_bot(config):
                 return
 
             groups_list = _get_config_groups(config)
+            gmap = config.get("group_map", {})
+            if not isinstance(gmap, dict):
+                gmap = {}
             added_names, skipped_names = [], []
 
             for idx in selected_indices:
                 item = fetched[idx - 1]
                 link = item["link"]
+                ent = item.get("entity")
+                if ent and hasattr(ent, 'id'):
+                    gmap[link.strip().rstrip('/')] = ent.id
                 if link not in groups_list:
                     groups_list.append(link)
                     added_names.append(f"{idx}. {item['title']}")
@@ -956,7 +1044,8 @@ async def run_user_bot(config):
                     skipped_names.append(f"{idx}. {item['title']}")
 
             config["groups"] = groups_list
-            await asyncio.to_thread(db.update_user_config, phone, groups=groups_list)
+            config["group_map"] = gmap
+            await asyncio.to_thread(db.update_user_config, phone, groups=groups_list, group_map=gmap)
 
             reply = [
                 "📊 **Sequence Group Selection Results**",
@@ -983,14 +1072,25 @@ async def run_user_bot(config):
                 return
             added, skipped = [], []
             groups_list = _get_config_groups(config)
+            gmap = config.get("group_map", {})
+            if not isinstance(gmap, dict):
+                gmap = {}
             for link in links:
                 if link not in groups_list:
                     groups_list.append(link)
                     added.append(link)
                 else:
                     skipped.append(link)
+                clean_lk = link.strip().rstrip('/')
+                try:
+                    target_ent = await resolve_group_entity(client, link, config=config, phone=phone)
+                    if hasattr(target_ent, 'id'):
+                        gmap[clean_lk] = target_ent.id
+                except Exception:
+                    pass
             config["groups"] = groups_list
-            db.update_user_config(phone, groups=groups_list)
+            config["group_map"] = gmap
+            await asyncio.to_thread(db.update_user_config, phone, groups=groups_list, group_map=gmap)
             msg = []
             if added:
                 msg.append(f"✅ Added **{len(added)}** new group(s).")
@@ -1126,7 +1226,7 @@ async def run_user_bot(config):
             groups_to_check = list(groups_list)
             for idx, group in enumerate(groups_to_check, 1):
                 try:
-                    target_entity = await resolve_group_entity(client, group)
+                    target_entity = await resolve_group_entity(client, group, config=config, phone=phone)
                     display_name = get_entity_display_name(target_entity, group)
 
                     if isinstance(target_entity, str):
@@ -1316,7 +1416,7 @@ async def run_user_bot(config):
                         custom_sleep_done = False
                         
                         try:
-                            target_entity = await resolve_group_entity(client, group)
+                            target_entity = await resolve_group_entity(client, group, config=config, phone=phone)
                             if isinstance(target_entity, str):
                                 log_event(f"Cannot resolve {group}. Auto-removing group.")
                                 user_state["fail_total"] += 1
