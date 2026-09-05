@@ -36,8 +36,8 @@ import re
 import random
 import signal
 import tempfile
-import shutil
-from datetime import datetime, date, time, timedelta
+import time as time_mod
+from datetime import datetime, date, time as dt_time, timedelta
 from typing import Tuple, List, Optional, Any
 
 try:
@@ -133,21 +133,21 @@ def _load_autonight() -> dict:
 def _save_autonight(cfg: dict) -> None:
     db.save_autonight_settings(cfg)
 
-def _parse_hhmm(s: str) -> time:
+def _parse_hhmm(s: str) -> dt_time:
     s = s.strip()
     # Accept "7", "07", "7:00", "07:00"
     if re.fullmatch(r"\d{1,2}", s):
         h = int(s)
         if not (0 <= h <= 23):
             raise ValueError("Hour must be 0..23")
-        return time(h, 0)
+        return dt_time(h, 0)
     m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
     if not m:
         raise ValueError("Time must be HH or HH:MM (24h)")
     h, mm = int(m.group(1)), int(m.group(2))
     if not (0 <= h <= 23 and 0 <= mm <= 59):
         raise ValueError("Invalid time")
-    return time(h, mm)
+    return dt_time(h, mm)
 
 def _get_now_tz(tz_name: str) -> datetime:
     if not tz_name:
@@ -176,7 +176,7 @@ def _get_cycle_seconds_with_jitter(cycle_min: float) -> int:
         jitter = int(seconds * 0.15)
         return random.randint(seconds - jitter, seconds + jitter)
 
-def _in_window(now_t: time, start_t: time, end_t: time) -> bool:
+def _in_window(now_t: dt_time, start_t: dt_time, end_t: dt_time) -> bool:
     """True if now is within [start, end) with midnight wrap support."""
     if start_t <= end_t:
         return start_t <= now_t < end_t
@@ -543,7 +543,7 @@ async def resolve_group_entity(client, group_url: Any, config: dict = None, phon
     if not clean_link:
         return group_url
 
-    now_ts = time.time()
+    now_ts = time_mod.time()
     if clean_link in entity_cache:
         ent, cached_at = entity_cache[clean_link]
         if now_ts - cached_at < 300 and not isinstance(ent, str):
@@ -1667,11 +1667,11 @@ async def user_loader():
         await asyncio.sleep(10) # Check every 10s for faster configuration updates
 
 async def auto_restart_watchdog():
-    start_time = time.time()
+    start_time = time_mod.time()
     max_uptime = 30 * 3600 # 30 hours from startup
     while True:
         await asyncio.sleep(60)
-        elapsed = time.time() - start_time
+        elapsed = time_mod.time() - start_time
         if elapsed >= max_uptime:
             logger.info("30-hour process uptime reached. Auto-restarting runner process...")
             print(Fore.YELLOW + "\n[🔁] 30-hour process uptime reached. Auto-restarting engine...")
