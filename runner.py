@@ -60,7 +60,8 @@ from telethon.errors import (
     SlowModeWaitError,
     UserBannedInChannelError,
     ChannelPrivateError,
-    ChatAdminRequiredError
+    ChatAdminRequiredError,
+    PeerFloodError,
 )
 import telethon.utils as tel_utils
 from colorama import Fore, Style, init
@@ -1558,13 +1559,23 @@ async def run_user_bot(config):
                             log_event(f"Msg {msg_idx} Success -> {group}")
 
                         except FloodWaitError as e:
-                             log_event(f"FloodWait! Sleeping {e.seconds}s. Increasing delay.")
+                             log_event(f"FloodWait! Sleeping {e.seconds}s. Increasing delay for account safety.")
                              user_state["status"] = f"FloodWait ⏳ ({e.seconds}s)"
-                             user_state["delay"] = min(user_state["delay"] + 20, 600)
+                             user_state["delay"] = min(user_state["delay"] + 25, 600)
                              config["msg_delay_sec"] = user_state["delay"]
                              db.update_user_config(phone, msg_delay_sec=user_state["delay"])
                              now = _get_now_tz(tz)
-                             user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 5)
+                             user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 10)
+                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                             custom_sleep_done = True
+                        except PeerFloodError as e:
+                             log_event("⚠️ Telegram PeerFlood limit! Cool-down mode activated. Pausing 20m & increasing delay.")
+                             user_state["status"] = "Peer Flood Limit ⏳ (20m)"
+                             user_state["delay"] = min(user_state["delay"] + 30, 300)
+                             config["msg_delay_sec"] = user_state["delay"]
+                             db.update_user_config(phone, msg_delay_sec=user_state["delay"])
+                             now = _get_now_tz(tz)
+                             user_state["next_msg_at"] = now + timedelta(minutes=20)
                              await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
                              custom_sleep_done = True
                         except SlowModeWaitError as e:
@@ -1585,9 +1596,9 @@ async def run_user_bot(config):
                         if i < len(groups_list) and not custom_sleep_done:
                             # 🌙 Check if late night slow mode (00:00 -> 07:00 / after 12 AM)
                             if autonight_is_slow_mode(AUTONIGHT_CFG):
-                                eff_delay = max(user_state["delay"], 50.0) # 50s-65s slow delay overnight
+                                eff_delay = max(user_state["delay"], 60.0) # 60s-75s slow delay overnight
                             else:
-                                eff_delay = max(20.0, user_state["delay"])
+                                eff_delay = max(user_state["delay"], 35.0) # 35s-45s safe delay daytime
 
                             # 🛡️ Organic Human Jitter (85% - 125%) to evade Telegram automated bot detection patterns
                             wait_time = eff_delay * random.uniform(0.85, 1.25)
